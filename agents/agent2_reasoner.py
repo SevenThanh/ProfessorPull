@@ -2,8 +2,8 @@
 Agent 2 — Bug & Performance Reasoner (DeepSeek-V3)
 
 Input:  - agent1_summary: dict output from run_agent1()
-        - repo_files: list of files from repo_context_log.txt → repo_context["files"]
-          (temporary — will be replaced by Pinecone RAG retrieval once Johan's pipeline is ready)
+        - context_files: list of relevant files from rag.retrieval.get_context()
+          Each item has: path (str), content (str)
 
 Output: Structured findings JSON with bugs, performance issues, and risk scores.
         Passed directly to Agent 3 to write the human review comment.
@@ -33,61 +33,6 @@ HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json",
 }
-
-# ── RAG Placeholder ────────────────────────────────────────────────────────────
-# TODO: Replace this function with Johan's Pinecone retrieval pipeline.
-# Currently we filter repo files by looking for filenames mentioned in Agent 1's
-# summary. Once RAG is ready, swap this out for a semantic similarity search.
-
-def _get_relevant_files(agent1_summary: dict, repo_files: list[dict]) -> list[dict]:
-    """
-    Temporary RAG stand-in: finds repo files that are related to what changed.
-
-    Looks at the filenames Agent 1 flagged and finds other files in the repo
-    that share the same directory or are imported/referenced by the changed files.
-
-    Replace this entire function with a Pinecone query when Johan's pipeline is ready:
-        results = pinecone_index.query(vector=embed(query), top_k=10)
-    """
-    changed_filenames = {
-        f["filename"]
-        for f in agent1_summary.get("changed_files", [])
-    }
-
-    # Get the directories of changed files
-    changed_dirs = {
-        "/".join(fname.split("/")[:-1])
-        for fname in changed_filenames
-    }
-
-    relevant = []
-    for repo_file in repo_files:
-        path = repo_file.get("path", "")
-        content = repo_file.get("content")
-
-        # Skip files with no readable content
-        if not content:
-            continue
-
-        # Always include the changed files themselves (full content for context)
-        if path in changed_filenames:
-            relevant.append(repo_file)
-            continue
-
-        # Include files in the same directory as changed files
-        file_dir = "/".join(path.split("/")[:-1])
-        if file_dir and file_dir in changed_dirs:
-            relevant.append(repo_file)
-            continue
-
-        # Include files that import or reference any of the changed files
-        for changed in changed_filenames:
-            filename_only = changed.split("/")[-1].replace(".jsx", "").replace(".tsx", "").replace(".js", "").replace(".ts", "").replace(".py", "")
-            if filename_only.lower() in content.lower():
-                relevant.append(repo_file)
-                break
-
-    return relevant
 
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
@@ -192,16 +137,15 @@ def _parse_output(raw: str) -> dict:
 
 # ── Public Interface ───────────────────────────────────────────────────────────
 
-def run_agent2(agent1_summary: dict, repo_files: list[dict]) -> dict:
+def run_agent2(agent1_summary: dict, context_files: list[dict]) -> dict:
     """
     Analyze a PR for bugs and performance issues using DeepSeek-V3.
 
     Args:
         agent1_summary: The dict returned by run_agent1(). Contains changed_files,
                         overall_summary, overall_risk, and flags.
-        repo_files:     The `files` list from repo_context_log.txt → repo_context["files"].
-                        Each item has: path, sha, size, content.
-                        TODO: Replace with Pinecone RAG results when Johan's pipeline is ready.
+        context_files:  Relevant files returned by rag.retrieval.get_context().
+                        Each item has: path (str), content (str).
 
     Returns:
         Structured dict with findings, overall_risk, risk_reasoning, and approved.
@@ -215,9 +159,8 @@ def run_agent2(agent1_summary: dict, repo_files: list[dict]) -> dict:
             "approved": True,
         }
 
-    relevant_files  = _get_relevant_files(agent1_summary, repo_files)
-    user_prompt     = _build_user_prompt(agent1_summary, relevant_files)
-    raw_output      = _call_api(user_prompt)
+    user_prompt = _build_user_prompt(agent1_summary, context_files)
+    raw_output  = _call_api(user_prompt)
     return _parse_output(raw_output)
 
 
@@ -244,21 +187,17 @@ if __name__ == "__main__":
         "flags": []
     }
 
-    # Simulate a small slice of repo_context_log.txt → repo_context["files"]
-    sample_repo_files = [
+    # Simulate context returned by rag.retrieval.get_context()
+    sample_context_files = [
         {
             "path": "src/components/sections/About.jsx",
-            "sha": "abc123",
-            "size": 500,
             "content": "export const About = () => {\n  return (\n    <div>\n      <h3>Here you can put what you want to say about yourself. new changes for a practice commit</h3>\n    </div>\n  );\n};"
         },
         {
             "path": "src/App.jsx",
-            "sha": "def456",
-            "size": 300,
             "content": "import { About } from './components/sections/About';\n\nfunction App() {\n  return <About />;\n}\n\nexport default App;"
         }
     ]
 
-    result = run_agent2(sample_agent1_summary, sample_repo_files)
+    result = run_agent2(sample_agent1_summary, sample_context_files)
     print(json.dumps(result, indent=2))
