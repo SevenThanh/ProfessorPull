@@ -26,7 +26,7 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
     raise RuntimeError("Missing env var HF_TOKEN")
 
-API_URL = "https://router.huggingface.co/novita/v3/openai/chat/completions"
+API_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL   = "deepseek-ai/DeepSeek-V3"
 
 HEADERS = {
