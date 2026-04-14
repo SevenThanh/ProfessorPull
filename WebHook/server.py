@@ -1,4 +1,5 @@
 import os
+import sys
 import hmac
 import hashlib
 import json
@@ -7,9 +8,17 @@ import base64
 import asyncio
 from typing import Any
 
+# Allow imports from the ProfessorPull root (agents/, rag/)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 import httpx
 import jwt
 from fastapi import FastAPI, Request, HTTPException
+
+from rag.retrieval import get_context
+from agents.agent1_summarizer import run_agent1
+from agents.agent2_reasoner import run_agent2
+from agents.agent3_reviewer import run_agent3
 
 app = FastAPI()
 
@@ -406,22 +415,16 @@ async def github_webhook(request: Request):
             f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
         )
 
-        # --- Post review comment back to the PR ---
-        # TODO: replace `review_body` and `inline_comments` with real AI agent output
-        review_body = (
-            "## Professor Pull Review\n\n"
-            ":hourglass_flowing_sand: Analysis pipeline received this PR. "
-            "AI review will appear here once agents are wired in.\n\n"
-            f"**Files changed:** {len(pr_files)}  \n"
-            f"**Head SHA:** `{head_sha[:7]}`"
-        )
+        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
+        rag_context = get_context(retrieval_summary["files"], repo_name)
+        print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
 
-        # Example inline comment shape — pass [] or omit until agents produce real output
-        inline_comments: list[dict[str, Any]] = []
-        # inline_comments = [
-        #     {"path": "src/main.py", "line": 42, "body": "Consider extracting this into a helper."},
-        # ]
+        # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
+        agent1_summary  = run_agent1(retrieval_summary["files"])
+        agent2_findings = run_agent2(agent1_summary, rag_context)
+        review_body     = run_agent3(agent1_summary, agent2_findings)
 
+        # --- Handoff C: Jake → Matt — post the final review to the PR ---
         try:
             await post_pr_review(
                 owner=owner,
@@ -430,7 +433,6 @@ async def github_webhook(request: Request):
                 token=installation_token,
                 commit_id=head_sha,
                 body=review_body,
-                inline_comments=inline_comments or None,
                 event="COMMENT",
             )
             print(f"[{delivery_id}] Posted review comment to PR #{pr_number}")
