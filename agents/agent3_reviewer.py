@@ -118,7 +118,7 @@ Format it clearly with sections for: Overview, Changes, Findings (if any), and V
 
 # ── API Call ───────────────────────────────────────────────────────────────────
 
-def _call_api(user_prompt: str) -> str:
+def _call_api(user_prompt: str, retries: int = 2) -> str:
     payload = {
         "model": MODEL,
         "messages": [
@@ -129,14 +129,21 @@ def _call_api(user_prompt: str) -> str:
         "max_tokens": 1024,
     }
 
-    response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                print(f"Agent 3: request timed out, retrying (attempt {attempt + 1}/{retries})...")
+                continue
+            raise
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"HuggingFace API error {response.status_code}: {response.text}"
-        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"HuggingFace API error {response.status_code}: {response.text}"
+            )
 
-    return response.json()["choices"][0]["message"]["content"]
+        return response.json()["choices"][0]["message"]["content"]
 
 
 # ── Light cleanup ──────────────────────────────────────────────────────────────
