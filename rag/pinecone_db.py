@@ -23,4 +23,4 @@ def upsert(chunks, repo):
 
 def query(vec, repo, k=5):
     res = idx.query(vector=vec, top_k=k, namespace=repo, include_metadata=True)
-    return [m.metadata for m in res.matches]
+    return [{"id": m.id, "score": m.score, **m.metadata} for m in res.matches]
