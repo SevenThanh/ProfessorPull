@@ -4,6 +4,8 @@ Agent 2 — Bug & Performance Reasoner (DeepSeek-V3)
 Input:  - agent1_summary: dict output from run_agent1()
         - context_files: list of relevant files from rag.retrieval.get_context()
           Each item has: path (str), content (str)
+        - pr_files: raw changed files from the PR (same list passed to Agent 1)
+          Each item has: filename, status, additions, deletions, patch
 
 Output: Structured findings JSON with bugs, performance issues, and risk scores.
         Passed directly to Agent 3 to write the human review comment.
@@ -39,13 +41,15 @@ HEADERS = {
 
 SYSTEM_PROMPT = """You are a senior software engineer performing a thorough code review.
 You will be given:
-1. A summary of what changed in a pull request (from a previous analysis step)
-2. Relevant files from the codebase for context
+1. The raw diffs from the pull request — the actual lines added and removed
+2. A summary of what changed (from a previous analysis step)
+3. Relevant files from the codebase for context
 
 Your job is to reason carefully about whether the changes could cause bugs or performance issues.
-Be thorough — flag anything suspicious, even if it might be minor.
+Always analyze the raw diffs directly — do not rely solely on the summary.
 
 Focus on:
+- Syntax errors: missing brackets, braces, parentheses, or other structural breaks that would prevent the code from running
 - Bug detection: logic errors, null/undefined handling, off-by-one errors, broken imports, type mismatches
 - Performance issues: unnecessary re-renders, expensive operations in loops, memory leaks, blocking calls
 
@@ -53,31 +57,52 @@ IMPORTANT:
 - Respond ONLY with valid JSON. No explanation, no markdown, no code fences.
 - If you find no issues, return an empty findings array — do not invent problems.
 - Be specific: reference exact filenames and describe the exact concern.
+- A syntax error that breaks the build is always high severity.
 """
 
-def _build_user_prompt(agent1_summary: dict, relevant_files: list[dict]) -> str:
+def _build_user_prompt(agent1_summary: dict, context_files: list[dict], pr_files: list[dict]) -> str:
+    # Format raw diffs
+    diff_sections = []
+    for f in pr_files:
+        filename  = f.get("filename", "unknown")
+        status    = f.get("status", "modified")
+        additions = f.get("additions", 0)
+        deletions = f.get("deletions", 0)
+        patch     = f.get("patch", "")
+        if not patch:
+            continue
+        diff_sections.append(
+            f"FILE: {filename}\n"
+            f"STATUS: {status} (+{additions} / -{deletions})\n"
+            f"DIFF:\n{patch}"
+        )
+    diffs_block = "\n\n---\n\n".join(diff_sections) if diff_sections else "No diff content available."
+
     # Format Agent 1's summary
     summary_block = json.dumps(agent1_summary, indent=2)
 
     # Format relevant repo files for context
     file_blocks = []
-    for f in relevant_files:
+    for f in context_files:
         path    = f.get("path", "unknown")
         content = f.get("content", "")
         if content:
             file_blocks.append(f"FILE: {path}\n```\n{content}\n```")
-
     files_block = "\n\n".join(file_blocks) if file_blocks else "No additional context files available."
 
-    return f"""Here is the pull request summary from the previous analysis step:
+    return f"""Here are the raw diffs from the pull request. Analyze these directly for any issues:
+
+{diffs_block}
+
+Here is the summary from the previous analysis step (use for context, but do not rely on it exclusively):
 
 {summary_block}
 
-Here are the relevant files from the codebase for context:
+Here are relevant files from the codebase for additional context:
 
 {files_block}
 
-Based on the changes described and the codebase context, identify any bugs or performance issues.
+Based on the raw diffs and codebase context, identify any bugs, syntax errors, or performance issues.
 
 Return this exact JSON structure:
 {{
@@ -137,7 +162,7 @@ def _parse_output(raw: str) -> dict:
 
 # ── Public Interface ───────────────────────────────────────────────────────────
 
-def run_agent2(agent1_summary: dict, context_files: list[dict]) -> dict:
+def run_agent2(agent1_summary: dict, context_files: list[dict], pr_files: list[dict]) -> dict:
     """
     Analyze a PR for bugs and performance issues using DeepSeek-V3.
 
@@ -146,6 +171,8 @@ def run_agent2(agent1_summary: dict, context_files: list[dict]) -> dict:
                         overall_summary, overall_risk, and flags.
         context_files:  Relevant files returned by rag.retrieval.get_context().
                         Each item has: path (str), content (str).
+        pr_files:       Raw changed files from the PR (same list passed to Agent 1).
+                        Each item has: filename, status, additions, deletions, patch.
 
     Returns:
         Structured dict with findings, overall_risk, risk_reasoning, and approved.
@@ -159,7 +186,7 @@ def run_agent2(agent1_summary: dict, context_files: list[dict]) -> dict:
             "approved": True,
         }
 
-    user_prompt = _build_user_prompt(agent1_summary, context_files)
+    user_prompt = _build_user_prompt(agent1_summary, context_files, pr_files)
     raw_output  = _call_api(user_prompt)
     return _parse_output(raw_output)
 
@@ -199,5 +226,26 @@ if __name__ == "__main__":
         }
     ]
 
-    result = run_agent2(sample_agent1_summary, sample_context_files)
+    # Simulate raw PR files (same format as retrieval_log.txt → retrieval["files"])
+    sample_pr_files = [
+        {
+            "filename": "src/components/sections/About.jsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "patch": (
+                "@@ -7,7 +7,7 @@ export const About = () => {\n"
+                "                 </h2>\n"
+                "                 <div className=\"glass rounded-xl\">\n"
+                "                     <h3 className=\"text-white text-lg\">\n"
+                "-                        Here you can put what you want to say about yourself. Some differece for testing \n"
+                "+                        Here you can put what you want to say about yourself. new changes for a practice commit\n"
+                "                     </h3>\n"
+                "                 </div>\n"
+                "             </div>"
+            ),
+        }
+    ]
+
+    result = run_agent2(sample_agent1_summary, sample_context_files, sample_pr_files)
     print(json.dumps(result, indent=2))

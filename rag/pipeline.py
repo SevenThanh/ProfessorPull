@@ -11,7 +11,7 @@ def run_review(files, repo_name):
         print("Step 2: Running Agent 1 (summarizer)...")
         summary = run_agent1(files)
         print("Step 3: Running Agent 2 (reasoner)...")
-        findings = run_agent2(summary, ctx)
+        findings = run_agent2(summary, ctx, files)
         print("Step 4: Running Agent 3 (reviewer)...")
         md = run_agent3(summary, findings)
         print("Pipeline complete.")
