@@ -1,4 +1,5 @@
 import os
+import sys
 import hmac
 import hashlib
 import json
@@ -7,9 +8,17 @@ import base64
 import asyncio
 from typing import Any
 
+# Allow imports from the ProfessorPull root (agents/, rag/)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 import httpx
 import jwt
 from fastapi import FastAPI, Request, HTTPException
+
+from rag.retrieval import get_context
+from agents.agent1_summarizer import run_agent1
+from agents.agent2_reasoner import run_agent2
+from agents.agent3_reviewer import run_agent3
 
 app = FastAPI()
 
@@ -281,27 +290,44 @@ async def fetch_pr_files(owner: str, repo: str, pr_number: int, token: str) -> l
     return files
 
 
-def save_retrieval_summary(delivery_id: str | None, summary: dict[str, Any]) -> str:
-    out_dir = os.path.dirname(__file__)
-    out_path = os.path.join(out_dir, "retrieval_log.txt")
+def get_next_pr_folder() -> str:
+    base_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(base_dir, exist_ok=True)
+    existing = [
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("pr_")
+    ]
+    numbers = []
+    for name in existing:
+        try:
+            numbers.append(int(name.split("_", 1)[1]))
+        except (IndexError, ValueError):
+            pass
+    next_num = max(numbers, default=0) + 1
+    folder = os.path.join(base_dir, f"pr_{next_num}")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def save_retrieval_summary(delivery_id: str | None, summary: dict[str, Any], folder: str) -> str:
+    out_path = os.path.join(folder, "retrieval_log.txt")
     entry = {
         "delivery_id": delivery_id,
         "retrieval": summary,
     }
-    with open(out_path, "a", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(entry, indent=2))
         f.write("\n" + ("=" * 80) + "\n")
     return out_path
 
 
-def save_repo_context(delivery_id: str | None, context: dict[str, Any]) -> str:
-    out_dir = os.path.dirname(__file__)
-    out_path = os.path.join(out_dir, "repo_context_log.txt")
+def save_repo_context(delivery_id: str | None, context: dict[str, Any], folder: str) -> str:
+    out_path = os.path.join(folder, "repo_context_log.txt")
     entry = {
         "delivery_id": delivery_id,
         "repo_context": context,
     }
-    with open(out_path, "a", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(entry, indent=2))
         f.write("\n" + ("=" * 80) + "\n")
     return out_path
@@ -380,30 +406,25 @@ async def github_webhook(request: Request):
             f"[{delivery_id}] Retrieved PR data: changed_files={len(pr_files)} "
             f"title={pr_data.get('title')!r}"
         )
-        saved_path = save_retrieval_summary(delivery_id, retrieval_summary)
-        context_path = save_repo_context(delivery_id, repo_context)
+        pr_folder = get_next_pr_folder()
+        saved_path = save_retrieval_summary(delivery_id, retrieval_summary, pr_folder)
+        context_path = save_repo_context(delivery_id, repo_context, pr_folder)
         print(f"[{delivery_id}] Saved retrieval summary to {saved_path}")
         print(
             f"[{delivery_id}] Saved repo context to {context_path} "
             f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
         )
 
-        # --- Post review comment back to the PR ---
-        # TODO: replace `review_body` and `inline_comments` with real AI agent output
-        review_body = (
-            "## Professor Pull Review\n\n"
-            ":hourglass_flowing_sand: Analysis pipeline received this PR. "
-            "AI review will appear here once agents are wired in.\n\n"
-            f"**Files changed:** {len(pr_files)}  \n"
-            f"**Head SHA:** `{head_sha[:7]}`"
-        )
+        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
+        rag_context = get_context(retrieval_summary["files"], repo_name)
+        print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
 
-        # Example inline comment shape — pass [] or omit until agents produce real output
-        inline_comments: list[dict[str, Any]] = []
-        # inline_comments = [
-        #     {"path": "src/main.py", "line": 42, "body": "Consider extracting this into a helper."},
-        # ]
+        # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
+        agent1_summary  = run_agent1(retrieval_summary["files"])
+        agent2_findings = run_agent2(agent1_summary, rag_context)
+        review_body     = run_agent3(agent1_summary, agent2_findings)
 
+        # --- Handoff C: Jake → Matt — post the final review to the PR ---
         try:
             await post_pr_review(
                 owner=owner,
@@ -412,7 +433,6 @@ async def github_webhook(request: Request):
                 token=installation_token,
                 commit_id=head_sha,
                 body=review_body,
-                inline_comments=inline_comments or None,
                 event="COMMENT",
             )
             print(f"[{delivery_id}] Posted review comment to PR #{pr_number}")
