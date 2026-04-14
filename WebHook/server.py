@@ -421,7 +421,7 @@ async def github_webhook(request: Request):
 
         # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
         agent1_summary  = run_agent1(retrieval_summary["files"])
-        agent2_findings = run_agent2(agent1_summary, rag_context)
+        agent2_findings = run_agent2(agent1_summary, rag_context, retrieval_summary["files"])
         review_body     = run_agent3(agent1_summary, agent2_findings)
 
         # --- Handoff C: Jake → Matt — post the final review to the PR ---
