@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import httpx
 import jwt
 from fastapi import FastAPI, Request, HTTPException
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 
 from rag.retrieval import get_context
 from agents.agent1_summarizer import run_agent1
