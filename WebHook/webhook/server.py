@@ -281,27 +281,44 @@ async def fetch_pr_files(owner: str, repo: str, pr_number: int, token: str) -> l
     return files
 
 
-def save_retrieval_summary(delivery_id: str | None, summary: dict[str, Any]) -> str:
-    out_dir = os.path.dirname(__file__)
-    out_path = os.path.join(out_dir, "retrieval_log.txt")
+def get_next_pr_folder() -> str:
+    base_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(base_dir, exist_ok=True)
+    existing = [
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("pr_")
+    ]
+    numbers = []
+    for name in existing:
+        try:
+            numbers.append(int(name.split("_", 1)[1]))
+        except (IndexError, ValueError):
+            pass
+    next_num = max(numbers, default=0) + 1
+    folder = os.path.join(base_dir, f"pr_{next_num}")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def save_retrieval_summary(delivery_id: str | None, summary: dict[str, Any], folder: str) -> str:
+    out_path = os.path.join(folder, "retrieval_log.txt")
     entry = {
         "delivery_id": delivery_id,
         "retrieval": summary,
     }
-    with open(out_path, "a", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(entry, indent=2))
         f.write("\n" + ("=" * 80) + "\n")
     return out_path
 
 
-def save_repo_context(delivery_id: str | None, context: dict[str, Any]) -> str:
-    out_dir = os.path.dirname(__file__)
-    out_path = os.path.join(out_dir, "repo_context_log.txt")
+def save_repo_context(delivery_id: str | None, context: dict[str, Any], folder: str) -> str:
+    out_path = os.path.join(folder, "repo_context_log.txt")
     entry = {
         "delivery_id": delivery_id,
         "repo_context": context,
     }
-    with open(out_path, "a", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(entry, indent=2))
         f.write("\n" + ("=" * 80) + "\n")
     return out_path
@@ -380,8 +397,9 @@ async def github_webhook(request: Request):
             f"[{delivery_id}] Retrieved PR data: changed_files={len(pr_files)} "
             f"title={pr_data.get('title')!r}"
         )
-        saved_path = save_retrieval_summary(delivery_id, retrieval_summary)
-        context_path = save_repo_context(delivery_id, repo_context)
+        pr_folder = get_next_pr_folder()
+        saved_path = save_retrieval_summary(delivery_id, retrieval_summary, pr_folder)
+        context_path = save_repo_context(delivery_id, repo_context, pr_folder)
         print(f"[{delivery_id}] Saved retrieval summary to {saved_path}")
         print(
             f"[{delivery_id}] Saved repo context to {context_path} "
