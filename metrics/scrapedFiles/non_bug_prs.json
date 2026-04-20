@@ -1,0 +1,216 @@
+[
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 15257,
+    "title": "docs: Add advanced middleware examples (timing, request ID, rate limiting)",
+    "body": "Adds 5 production middleware examples to the Advanced User Guide: timing, request ID tracing, rate limiting, ordering, and state access.",
+    "merged": false,
+    "diff": "diff --git a/docs/en/docs/advanced/middleware.md b/docs/en/docs/advanced/middleware.md\nindex 65f9438c95f23..95ffa7f740bcd 100644\n--- a/docs/en/docs/advanced/middleware.md\n+++ b/docs/en/docs/advanced/middleware.md\n@@ -95,3 +95,199 @@ For example:\n * [MessagePack](https://github.com/florimondmanca/msgpack-asgi)\n \n To see other available middlewares check [Starlette's Middleware docs](https://www.starlette.dev/middleware/) and the [ASGI Awesome List](https://github.com/florimondmanca/awesome-asgi).\n+\n+## Custom Middleware Examples { #custom-middleware-examples }\n+\n+The following examples demonstrate common middleware patterns used in production FastAPI applications. Each middleware is self-contained and can be added directly to your application.\n+\n+### Timing Middleware { #timing-middleware }\n+\n+Track how long each request takes to process. The elapsed time is added as an `X-Process-Time` response header, which is useful for performance monitoring and APM tools.\n+\n+```python\n+import time\n+from fastapi import FastAPI, Request\n+\n+app = FastAPI()\n+\n+\n+@app.middleware(\"http\")\n+async def add_process_time_header(request: Request, call_next):\n+    \"\"\"\n+    Measure request processing time and expose it via response header.\n+\n+    The header value is in seconds (float), e.g. 0.023 for 23 milliseconds.\n+    Compatible with Prometheus, Datadog, and most APM agents.\n+    \"\"\"\n+    start_time = time.perf_counter()\n+    response = await call_next(request)\n+    process_time = time.perf_counter() - start_time\n+    response.headers[\"X-Process-Time\"] = f\"{process_time:.6f}\"\n+    return response\n+```\n+\n+You can read this header in your frontend or monitoring system:\n+\n+```python\n+# Client-side example\n+import httpx\n+\n+async with httpx.AsyncClient() as client:\n+    r = await client.get(\"http://localhost:8000/items/\")\n+    print(f\"Server processing time: {r.headers['x-process-time']}s\")\n+```\n+\n+### Request ID Middleware { #request-id-middleware }\n+\n+Assign a unique identifier to every incoming request. This is essential for distributed tracing across microservices and for correlating log entries.\n+\n+```python\n+import uuid\n+from fastapi import FastAPI, Request\n+\n+app = FastAPI()\n+\n+\n+@app.middleware(\"http\")\n+async def add_request_id(request: Request, call_next):\n+    \"\"\"\n+    Assign a UUID4 request ID to every request.\n+\n+    The ID is available in:\n+    - request.state.request_id (accessible in route handlers and dependencies)\n+    - X-Request-ID response header (returned to the client)\n+\n+    Usage in a route handler:\n+        @app.get(\"/items/\")\n+        async def get_items(request: Request):\n+            rid = request.state.request_id\n+            logger.info(\"Handling request\", extra={\"request_id\": rid})\n+    \"\"\"\n+    request_id = str(uuid.uuid4())\n+    request.state.request_id = request_id\n+    response = await call_next(request)\n+    response.headers[\"X-Request-ID\"] = request_id\n+    return response\n+```\n+\n+/// tip\n+\n+If the client sends an `X-Request-ID` header (e.g., from a load balancer), you can honour it:\n+\n+```python\n+request_id = request.headers.get(\"X-Request-ID\") or str(uuid.uuid4())\n+```\n+\n+///\n+\n+### Rate Limiting Middleware { #rate-limiting-middleware }\n+\n+A simple in-memory rate limiter that restricts each IP address to a configurable number of requests per time window. For production use, replace the in-memory store with Redis.\n+\n+```python\n+import time\n+from collections import defaultdict\n+from fastapi import FastAPI, Request\n+from fastapi.responses import JSONResponse\n+\n+app = FastAPI()\n+\n+# Configuration\n+RATE_LIMIT_REQUESTS = 100   # Max requests\n+RATE_LIMIT_WINDOW = 60      # Per 60 seconds\n+\n+# In-memory store: {ip: [timestamp, timestamp, ...]}\n+_request_counts: dict[str, list[float]] = defaultdict(list)\n+\n+\n+@app.middleware(\"http\")\n+async def rate_limit_middleware(request: Request, call_next):\n+    \"\"\"\n+    Sliding window rate limiter per client IP address.\n+\n+    Returns HTTP 429 Too Many Requests when the limit is exceeded.\n+    Adds X-RateLimit-* headers to all responses for client awareness.\n+\n+    For production: replace _request_counts with a Redis-backed solution\n+    (e.g., slowapi library or a custom Redis INCR + EXPIRE approach).\n+    \"\"\"\n+    client_ip = request.client.host if request.client else \"unknown\"\n+    now = time.time()\n+    window_start = now - RATE_LIMIT_WINDOW\n+\n+    # Remove timestamps outside the current window\n+    _request_counts[client_ip] = [\n+        ts for ts in _request_counts[client_ip] if ts > window_start\n+    ]\n+\n+    request_count = len(_request_counts[client_ip])\n+\n+    if request_count >= RATE_LIMIT_REQUESTS:\n+        return JSONResponse(\n+            status_code=429,\n+            content={\"detail\": \"Too many requests. Please try again later.\"},\n+            headers={\n+                \"X-RateLimit-Limit\": str(RATE_LIMIT_REQUESTS),\n+                \"X-RateLimit-Remaining\": \"0\",\n+                \"Retry-After\": str(RATE_LIMIT_WINDOW),\n+            },\n+        )\n+\n+    _request_counts[client_ip].append(now)\n+    response = await call_next(request)\n+    response.headers[\"X-RateLimit-Limit\"] = str(RATE_LIMIT_REQUESTS)\n+    response.headers[\"X-RateLimit-Remaining\"] = str(\n+        RATE_LIMIT_REQUESTS - request_count - 1\n+    )\n+    return response\n+```\n+\n+### Combining Multiple Middlewares { #combining-multiple-middlewares }\n+\n+Middlewares are applied in reverse registration order (last registered = outermost). Here is a recommended ordering:\n+\n+```python\n+from fastapi import FastAPI\n+\n+app = FastAPI()\n+\n+# Order matters: add_request_id runs first (outermost),\n+# rate_limit_middleware runs second,\n+# add_process_time_header runs last (innermost, closest to the route handler).\n+\n+app.add_middleware(BaseHTTPMiddleware, dispatch=add_process_time_header_dispatch)\n+app.add_middleware(BaseHTTPMiddleware, dispatch=rate_limit_dispatch)\n+app.add_middleware(BaseHTTPMiddleware, dispatch=add_request_id_dispatch)\n+```\n+\n+/// warning | Performance note\n+\n+Each `BaseHTTPMiddleware` layer adds a small overhead due to Python async context switching. For high-throughput applications (> 1000 req/s), consider using Starlette's `@app.middleware(\"http\")` decorator or pure ASGI middleware for the most performance-critical layers.\n+\n+///\n+\n+### Accessing Middleware State in Route Handlers { #accessing-middleware-state-in-route-handlers }\n+\n+State set on `request.state` in middleware is accessible throughout the entire request lifecycle:\n+\n+```python\n+from fastapi import FastAPI, Request\n+import uuid\n+\n+app = FastAPI()\n+\n+\n+@app.middleware(\"http\")\n+async def set_request_context(request: Request, call_next):\n+    request.state.request_id = str(uuid.uuid4())\n+    request.state.user_agent = request.headers.get(\"user-agent\", \"unknown\")\n+    return await call_next(request)\n+\n+\n+@app.get(\"/debug\")\n+async def debug_endpoint(request: Request):\n+    return {\n+        \"request_id\": request.state.request_id,\n+        \"user_agent\": request.state.user_agent,\n+    }\n+```\n",
+    "human_comments": [
+      {
+        "body": "We already have this.\nSee https://fastapi.tiangolo.com/tutorial/middleware/#multiple-middleware-execution-order",
+        "path": "docs/en/docs/advanced/middleware.md",
+        "line": 245
+      },
+      {
+        "body": "We already have such example: https://fastapi.tiangolo.com/tutorial/middleware/#create-a-middleware",
+        "path": "docs/en/docs/advanced/middleware.md",
+        "line": 103
+      }
+    ],
+    "pr_type": "feature_or_refactor"
+  },
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 14982,
+    "title": "\ud83d\udd27 Add FastAPI Agents Skill",
+    "body": "\ud83d\udd27 Add FastAPI Agents Skill",
+    "merged": true,
+    "diff": "diff --git a/fastapi/.agents/skills/fastapi/SKILL.md b/fastapi/.agents/skills/fastapi/SKILL.md\nnew file mode 100644\nindex 0000000000000..99e2b3b412bdf\n--- /dev/null\n+++ b/fastapi/.agents/skills/fastapi/SKILL.md\n@@ -0,0 +1,614 @@\n+---\n+name: fastapi\n+description: FastAPI best practices and conventions. Use when working with FastAPI APIs and Pydantic models for them. Keeps FastAPI code clean and up to date with the latest features and patterns, updated with new versions. Write new code or refactor and update old code.\n+---\n+\n+# FastAPI\n+\n+Official FastAPI skill to write code with best practices, keeping up to date with new versions and features.\n+\n+## Use the `fastapi` CLI\n+\n+Run the development server on localhost with reload:\n+\n+```bash\n+fastapi dev\n+```\n+\n+\n+Run the production server:\n+\n+```bash\n+fastapi run\n+```\n+\n+### Add an entrypoint in `pyproject.toml`\n+\n+FastAPI CLI will read the entrypoint in `pyproject.toml` to know where the FastAPI app is declared.\n+\n+```toml\n+[tool.fastapi]\n+entrypoint = \"my_app.main:app\"\n+```\n+\n+### Use `fastapi` with a path\n+\n+When adding the entrypoint to `pyproject.toml` is not possible, or the user explicitly asks not to, or it's running an independent small app, you can pass the app file path to the `fastapi` command:\n+\n+```bash\n+fastapi dev my_app/main.py\n+```\n+\n+Prefer to set the entrypoint in `pyproject.toml` when possible.\n+\n+## Use `Annotated`\n+\n+Always prefer the `Annotated` style for parameter and dependency declarations.\n+\n+It keeps the function signatures working in other contexts, respects the types, allows reusability.\n+\n+### In Parameter Declarations\n+\n+Use `Annotated` for parameter declarations, including `Path`, `Query`, `Header`, etc.:\n+\n+```python\n+from typing import Annotated\n+\n+from fastapi import FastAPI, Path, Query\n+\n+app = FastAPI()\n+\n+\n+@app.get(\"/items/{item_id}\")\n+async def read_item(\n+    item_id: Annotated[int, Path(ge=1, description=\"The item ID\")],\n+    q: Annotated[str | None, Query(max_length=50)] = None,\n+):\n+    return {\"message\": \"Hello World\"}\n+```\n+\n+instead of:\n+\n+```python\n+# DO NOT DO THIS\n+@app.get(\"/items/{item_id}\")\n+async def read_item(\n+    item_id: int = Path(ge=1, description=\"The item ID\"),\n+    q: str | None = Query(default=None, max_length=50),\n+):\n+    return {\"message\": \"Hello World\"}\n+```\n+\n+### For Dependencies\n+\n+Use `Annotated` for dependencies with `Depends()`.\n+\n+Unless asked not to, create a new type alias for the dependency to allow re-using it.\n+\n+```python\n+from typing import Annotated\n+\n+from fastapi import Depends, FastAPI\n+\n+app = FastAPI()\n+\n+\n+def get_current_user():\n+    return {\"username\": \"johndoe\"}\n+\n+\n+CurrentUserDep = Annotated[dict, Depends(get_current_user)]\n+\n+\n+@app.get(\"/items/\")\n+async def read_item(current_user: CurrentUserDep):\n+    return {\"message\": \"Hello World\"}\n+```\n+\n+instead of:\n+\n+```python\n+# DO NOT DO THIS\n+@app.get(\"/items/\")\n+async def read_item(current_user: dict = Depends(get_current_user)):\n+    return {\"message\": \"Hello World\"}\n+```\n+\n+## Do not use Ellipsis for *path operations* or Pydantic models\n+\n+Do not use `...` as a default value for required parameters, it's not needed and not recommended.\n+\n+Do this, without Ellipsis (`...`):\n+\n+```python\n+from typing import Annotated\n+\n+from fastapi import FastAPI, Query\n+from pydantic import BaseModel, Field\n+\n+\n+class Item(BaseModel):\n+    name: str\n+    description: str | None = None\n+    price: float = Field(gt=0)\n+\n+\n+app = FastAPI()\n+\n+\n+@app.post(\"/items/\")\n+async def create_item(item: Item, project_id: Annotated[int, Query()]): ...\n+```\n+\n+instead of this:\n+\n+```python\n+# DO NOT DO THIS\n+class Item(BaseModel):\n+    name: str = ...\n+    description: str | None = None\n+    price: float = Field(..., gt=0)\n+\n+\n+app = FastAPI()\n+\n+\n+@app.post(\"/items/\")\n+async def create_item(item: Item, project_id: Annotated[int, Query(...)]): ...\n+```\n+\n+## Return Type or Response Model\n+\n+When possible, include a return type. It will be used to validate, filter, document, and serialize the response.\n+\n+```python\n+from fastapi import FastAPI\n+from pydantic import BaseModel\n+\n+app = FastAPI()\n+\n+\n+class Item(BaseModel):\n+    name: str\n+    description: str | None = None\n+\n+\n+@app.get(\"/items/me\")\n+async def get_item() -> Item:\n+    return Item(name=\"Plumbus\", description=\"All-purpose home device\")\n+```\n+\n+**Important**: Return types or response models are what filter data ensuring no sensitive information is exposed. And they are used to serialize data with Pydantic (in Rust), this is the main idea that can increase response performance.\n+\n+The return type doesn't have to be a Pydantic model, it could be a different type, like a list of integers, or a dict, etc.\n+\n+### When to use `response_model` instead\n+\n+If the return type is not the same as the type that you want to use to validate, filter, or serialize, use the `response_model` parameter on the decorator instead.\n+\n+```python\n+from typing import Any\n+\n+from fastapi import FastAPI\n+from pydantic import BaseModel\n+\n+app = FastAPI()\n+\n+\n+class Item(BaseModel):\n+    name: str\n+    description: str | None = None\n+\n+\n+@app.get(\"/items/me\", response_model=Item)\n+async def get_item() -> Any:\n+    return {\"name\": \"Foo\", \"description\": \"A very nice Item\"}\n+```\n+\n+This can be particularly useful when filtering data to expose only the public fields and avoid exposing sensitive information.\n+\n+```python\n+from typing import Any\n+\n+from fastapi import FastAPI\n+from pydantic import BaseModel\n+\n+app = FastAPI()\n+\n+\n+class InternalItem(BaseModel):\n+    name: str\n+    description: str | None = None\n+    secret_key: str\n+\n+\n+class Item(BaseModel):\n+    name: str\n+    description: str | None = None\n+\n+\n+@app.get(\"/items/me\", response_model=Item)\n+async def get_item() -> Any:\n+    item = InternalItem(\n+        name=\"Foo\", description=\"A very nice Item\", secret_key=\"supersecret\"\n+    )\n+    return item\n+```\n+\n+## Performance\n+\n+Do not use `ORJSONResponse` or `UJSONResponse`, they are deprecated.\n+\n+Instead, declare a return type or response model. Pydantic will handle the data serialization on the Rust side.\n+\n+## Including Routers\n+\n+When declaring routers, prefer to add router level parameters like prefix, tags, etc. to the router itself, instead of in `include_router()`.\n+\n+Do this:\n+\n+```python\n+from fastapi import APIRouter, FastAPI\n+\n+app = FastAPI()\n+\n+router = APIRouter(prefix=\"/items\", tags=[\"items\"])\n+\n+\n+@router.get(\"/\")\n+async def list_items():\n+    return []\n+\n+\n+# In main.py\n+app.include_router(router)\n+```\n+\n+instead of this:\n+\n+```python\n+# DO NOT DO THIS\n+from fastapi import APIRouter, FastAPI\n+\n+app = FastAPI()\n+\n+router = APIRouter()\n+\n+\n+@router.get(\"/\")\n+async def list_items():\n+    return []\n+\n+\n+# In main.py\n+app.include_router(router, prefix=\"/items\", tags=[\"items\"])\n+```\n+\n+There could be exceptions, but try to follow this convention.\n+\n+Apply shared dependencies at the router level via `dependencies=[Depends(...)]`.\n+\n+## Dependency Injection\n+\n+Use dependencies when:\n+\n+* They can't be declared in Pydantic validation and require additional logic\n+* The logic depends on external resources or could block in any other way\n+* Other dependencies need their results (it's a sub-dependency)\n+* The logic can be shared by multiple endpoints to do things like error early, authentication, etc.\n+* They need to handle cleanup (e.g., DB sessions, file handles), using dependencies with `yield`\n+* Their logic needs input data from the request, like headers, query parameters, etc.\n+\n+### Dependencies with `yield` and `scope`\n+\n+When using dependencies with `yield`, they can have a `scope` that defines when the exit code is run.\n+\n+Use the default scope `\"request\"` to run the exit code after the response is sent back.\n+\n+```python\n+from typing import Annotated\n+\n+from fastapi import Depends, FastAPI\n+\n+app = FastAPI()\n+\n+\n+def get_db():\n+    db = DBSession()\n+    try:\n+        yield db\n+    finally:\n+        db.close()\n+\n+\n+DBDep = Annotated[DBSession, Depends(get_db)]\n+\n+\n+@app.get(\"/items/\")\n+async def read_items(db: DBDep):\n+    return db.query(Item).all()\n+```\n+\n+Use the scope `\"function\"` when they should run the exit code after the response data is generated but before the response is sent back to the client.\n+\n+```python\n+from typing import Annotated\n+\n+from fastapi import Depends, FastAPI\n+\n+app = FastAPI()\n+\n+\n+def get_username():\n+    try:\n+        yield \"Rick\"\n+    finally:\n+        print(\"Cleanup up before response is sent\")\n+\n+UserNameDep = Annotated[str, Depends(get_username, scope=\"function\")]\n+\n+@app.get(\"/users/me\")\n+def get_user_me(username: UserNameDep):\n+    return username\n+```\n+\n+### Class Dependencies\n+\n+Avoid creating class dependencies when possible.\n+\n+If a class is needed, instead create a regular function dependency that returns a class instance.\n+\n+Do this:\n+\n+```python\n+from dataclasses import dataclass\n+from typing import Annotated\n+\n+from fastapi import Depends, FastAPI\n+\n+app = FastAPI()\n+\n+\n+@dataclass\n+class DatabasePaginator:\n+    offset: int = 0\n+    limit: int = 100\n+    q: str | None = None\n+\n+    def get_page(self) -> dict:\n+        # Simulate a page of data\n+        return {\n+            \"offset\": self.offset,\n+            \"limit\": self.limit,\n+            \"q\": self.q,\n+            \"items\": [],\n+        }\n+\n+\n+def get_db_paginator(\n+    offset: int = 0, limit: int = 100, q: str | None = None\n+) -> DatabasePaginator:\n+    return DatabasePaginator(offset=offset, limit=limit, q=q)\n+\n+\n+PaginatorDep = Annotated[DatabasePaginator, Depends(get_db_paginator)]\n+\n+\n+@app.get(\"/items/\")\n+async def read_items(paginator: PaginatorDep):\n+    return paginator.get_page()\n+```\n+\n+instead of this:\n+\n+```python\n+# DO NOT DO THIS\n+from typing import Annotated\n+\n+from fastapi import Depends, FastAPI\n+\n+app = FastAPI()\n+\n+\n+class DatabasePaginator:\n+    def __init__(self, offset: int = 0, limit: int = 100, q: str | None = None):\n+        self.offset = offset\n+        self.limit = limit\n+        self.q = q\n+\n+    def get_page(self) -> dict:\n+        # Simulate a page of data\n+        return {\n+            \"offset\": self.offset,\n+            \"limit\": self.limit,\n+            \"q\": self.q,\n+            \"items\": [],\n+        }\n+\n+\n+@app.get(\"/items/\")\n+async def read_items(paginator: Annotated[DatabasePaginator, Depends()]):\n+    return paginator.get_page()\n+```\n+\n+## Async vs Sync *path operations*\n+\n+Use `async` *path operations* only when fully certain that the logic called inside is compatible with async and await (it's called with `await`) or that doesn't block.\n+\n+```python\n+from fastapi import FastAPI\n+\n+app = FastAPI()\n+\n+\n+# Use async def when calling async code\n+@app.get(\"/async-items/\")\n+async def read_async_items():\n+    data = await some_async_library.fetch_items()\n+    return data\n+\n+\n+# Use plain def when calling blocking/sync code or when in doubt\n+@app.get(\"/items/\")\n+def read_items():\n+    data = some_blocking_library.fetch_items()\n+    return data\n+```\n+\n+In case of doubt, or by default, use regular `def` functions, those will be run in a threadpool so they don't block the event loop.\n+\n+The same rules apply to dependencies.\n+\n+Make sure blocking code is not run inside of `async` functions. The logic will work, but will damage the performance heavily.\n+\n+### Asyncer\n+\n+When needing to run blocking code inside of async functions, or async code inside of blocking functions, suggest using Asyncer.\n+\n+Install:\n+\n+```bash\n+uv add asyncer\n+```\n+\n+Run blocking sync code inside of async with `asyncify()`:\n+\n+```python\n+from asyncer import asyncify\n+from fastapi import FastAPI\n+\n+app = FastAPI()\n+\n+\n+def do_blocking_work(name: str) -> str:\n+    # Some blocking I/O operation\n+    return f\"Hello {name}\"\n+\n+\n+@app.get(\"/items/\")\n+async def read_items():\n+    result = await asyncify(do_blocking_work)(name=\"World\")\n+    return {\"message\": result}\n+```\n+\n+And run async code inside of blocking sync code with `syncify()`:\n+\n+```python\n+from asyncer import syncify\n+from fastapi import FastAPI\n+\n+app = FastAPI()\n+\n+\n+async def do_async_work(name: str) -> str:\n+    return f\"Hello {name}\"\n+\n+\n+@app.get(\"/items/\")\n+def read_items():\n+    result = syncify(do_async_work)(name=\"World\")\n+    return {\"message\": result}\n+```\n+\n+## Use uv, ruff, ty\n+\n+If uv is available, use it to manage dependencies.\n+\n+If Ruff is available, use it to lint and format the code. Consider enabling the FastAPI rules.\n+\n+If ty is available, use it to check types.\n+\n+## SQLModel for SQL databases\n+\n+When working with SQL databases, prefer using SQLModel as it is integrated with Pydantic and will allow declaring data validation with the same models.\n+\n+## Do not use Pydantic RootModels\n+\n+Do not use Pydantic `RootModel`, instead use regular type annotations with `Annotated` and Pydantic validation utilities.\n+\n+For example, for a list with validations you could do:\n+\n+```python\n+from typing import Annotated\n+\n+from fastapi import Body, FastAPI\n+from pydantic import Field\n+\n+app = FastAPI()\n+\n+\n+@app.post(\"/items/\")\n+async def create_items(items: Annotated[list[int], Field(min_length=1), Body()]):\n+    return items\n+```\n+\n+instead of:\n+\n+```python\n+# DO NOT DO THIS\n+from typing import Annotated\n+\n+from fastapi import FastAPI\n+from pydantic import Field, RootModel\n+\n+app = FastAPI()\n+\n+\n+class ItemList(RootModel[Annotated[list[int], Field(min_length=1)]]):\n+    pass\n+\n+\n+@app.post(\"/items/\")\n+async def create_items(items: ItemList):\n+    return items\n+\n+```\n+\n+FastAPI supports these type annotations and will create a Pydantic `TypeAdapter` for them, so that types can work as normally and there's no need for the custom logic and types in RootModels.\n+\n+## Use one HTTP operation per function\n+\n+Don't mix HTTP operations in a single function, having one function per HTTP operation helps separate concerns and organize the code.\n+\n+Do this:\n+\n+```python\n+from fastapi import FastAPI\n+from pydantic import BaseModel\n+\n+app = FastAPI()\n+\n+\n+class Item(BaseModel):\n+    name: str\n+\n+\n+@app.get(\"/items/\")\n+async def list_items():\n+    return []\n+\n+\n+@app.post(\"/items/\")\n+async def create_item(item: Item):\n+    return item\n+```\n+\n+instead of this:\n+\n+```python\n+# DO NOT DO THIS\n+from fastapi import FastAPI, Request\n+from pydantic import BaseModel\n+\n+app = FastAPI()\n+\n+\n+class Item(BaseModel):\n+    name: str\n+\n+\n+@app.api_route(\"/items/\", methods=[\"GET\", \"POST\"])\n+async def handle_items(request: Request):\n+    if request.method == \"GET\":\n+        return []\n+```\n",
+    "human_comments": [
+      {
+        "body": "Not sure whether it matters much, but the order is a bit weird here because \"passing a path every time\" hasn't been clarified yet, and only becomes obvious in the next section (\"Use fastapi with a path\").\n\nI guess you wanted to have the best practice first though.",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "I like how there's a super short explanation here, which the agent could uses to defend its choice to its driver \ud83d\ude42  I wonder whether it would make sense to add similar short explanations to some of the other \"Do this, not this\" sections, like the Ellipsis ones?",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": 48
+      },
+      {
+        "body": "```suggestion\nInstead declare a return type or response model. Pydantic will handle the data serialization on the Rust side.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nWhen using dependencies with `yield`, they can have a `scope` that defines when the exit code is run.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nIf a class is needed, instead create a regular function dependency that returns a class instance.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "(or just \"in Rust\" ?)",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "Good point! Let me restructure a bit.",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "I've been on the fence on both sides... the recommendation is that a `SKILL.md` file should be up to 500 lines, this one is 640... that made me think of reducing how much to say. :sweat_smile: \r\n\r\nI'll give it another pass and see if I can shorten things, or add more explanations if necessary.\r\n\r\nI'm also trying to focus mainly on the things that current LLMs sometimes get wrong (e.g. using Ellipsis, or `= Depends()`), or new things that might not have been there when training, or simply not have enough datapoints in the data distribution, e.g. `Depends(func, scope=\"function\")`.\r\n\r\nLet me give it another fresh read and update. :nerd_face: ",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": 48
+      },
+      {
+        "body": "```suggestion\nRun the development server on localhost with reload:\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nRun the production server:\n```\nnitpick, but I think imperative sounds slightly better \ud83d\ude38 ",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "Do you think that for the \"DO NOT DO THIS\" examples, we need the full Python script? Would it be bad form if we would for instance just do:\r\n\r\n```python\r\nfrom typing import Annotated\r\n\r\nfrom fastapi import Depends, FastAPI\r\n\r\napp = FastAPI()\r\n\r\n\r\ndef get_current_user():\r\n    return {\"username\": \"johndoe\"}\r\n\r\n\r\nCurrentUserDep = Annotated[dict, Depends(get_current_user)]\r\n\r\n\r\n@app.get(\"/items/\")\r\nasync def read_item(current_user: CurrentUserDep):\r\n    return {\"message\": \"Hello World\"}\r\n```\r\n\r\ninstead of:\r\n\r\n```python\r\n# DO NOT DO THIS\r\n\r\n@app.get(\"/items/\")\r\nasync def read_item(current_user: dict = Depends(get_current_user)):\r\n    return {\"message\": \"Hello World\"}\r\n```\r\ni.e. not repeat the imports and definitions? Would it be an added bonus that the \"do not do this\" example wouldn't actually be functional by itself and thus more difficult to accidentally copy/paste?\r\n\r\nMaybe I'm overthinking things - was just looking for ways to shave more lines.",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": 48
+      },
+      {
+        "body": "```suggestion\nIf the return type is not the same as the type that you want to use to validate, filter, or serialize, use the `response_model` parameter on the decorator instead.\n```\nnitpick \ud83d\ude38 ",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nThis can be particularly useful when filtering data to expose only the public fields and avoid exposing sensitive information.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nMake sure blocking code is not run inside of `async` functions. The logic will work, but will damage the performance heavily.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nFor example, for a list with validations you could do:\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\n* The logic depends on external resources or could be blocked in any other way\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": 296
+      },
+      {
+        "body": "```suggestion\nThere could be exceptions, but try to follow this convention.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\nInstead, declare a return type or response model. Pydantic will handle the data serialization on the Rust side.\n```",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "That's a good point, I'm too used to making sure scripts are runnable as is, but in this case that's not the point. :sweat_smile: ",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": 48
+      },
+      {
+        "body": "Agreed!",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "Done!",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": null
+      },
+      {
+        "body": "This one refers to \"could block the event loop\", or \"could block the execution\".\r\n\r\nI'll leave it for now.",
+        "path": "fastapi/.agents/skills/fastapi/SKILL.md",
+        "line": 296
+      }
+    ],
+    "pr_type": "feature_or_refactor"
+  },
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 14943,
+    "title": "refactor: Improve type annotations and use python 3.10+ syntax",
+    "body": "- **ANN204**: add missing return type annotations in fastapi/security/\r\n- **UP038**:  use `X | Y` syntax for isinstance calls",
+    "merged": false,
+    "diff": "diff --git a/fastapi/dependencies/utils.py b/fastapi/dependencies/utils.py\nindex ab18ec2db65e5..2be24f7281af1 100644\n--- a/fastapi/dependencies/utils.py\n+++ b/fastapi/dependencies/utils.py\n@@ -381,19 +381,12 @@ def analyze_param(\n         fastapi_annotations = [\n             arg\n             for arg in annotated_args[1:]\n-            if isinstance(arg, (FieldInfo, params.Depends))\n+            if isinstance(arg, FieldInfo | params.Depends)\n         ]\n         fastapi_specific_annotations = [\n             arg\n             for arg in fastapi_annotations\n-            if isinstance(\n-                arg,\n-                (\n-                    params.Param,\n-                    params.Body,\n-                    params.Depends,\n-                ),\n-            )\n+            if isinstance(arg, params.Param | params.Body | params.Depends)\n         ]\n         if fastapi_specific_annotations:\n             fastapi_annotation: FieldInfo | params.Depends | None = (\n@@ -724,7 +717,7 @@ def _get_multidict_value(\n     if (\n         (not _is_json_field(field))\n         and field_annotation_is_sequence(field.field_info.annotation)\n-        and isinstance(values, (ImmutableMultiDict, Headers))\n+        and isinstance(values, ImmutableMultiDict | Headers)\n     ):\n         value = values.getlist(alias)\n     else:\n@@ -833,7 +826,7 @@ def request_params_to_args(\n     return values, errors\n \n \n-def is_union_of_base_models(field_type: Any) -> bool:\n+def is_union_of_base_models(field_type: type | None) -> bool:\n     \"\"\"Check if field type is a Union where all members are BaseModel subclasses.\"\"\"\n     from fastapi.types import UnionType\n \ndiff --git a/fastapi/security/api_key.py b/fastapi/security/api_key.py\nindex 89358a91367fc..8f7fab6d2069b 100644\n--- a/fastapi/security/api_key.py\n+++ b/fastapi/security/api_key.py\n@@ -16,7 +16,7 @@ def __init__(\n         description: str | None,\n         scheme_name: str | None,\n         auto_error: bool,\n-    ):\n+    ) -> None:\n         self.auto_error = auto_error\n \n         self.model: APIKey = APIKey(\n@@ -128,7 +128,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         super().__init__(\n             location=APIKeyIn.query,\n             name=name,\n@@ -216,7 +216,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         super().__init__(\n             location=APIKeyIn.header,\n             name=name,\n@@ -304,7 +304,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         super().__init__(\n             location=APIKeyIn.cookie,\n             name=name,\ndiff --git a/fastapi/security/http.py b/fastapi/security/http.py\nindex 05299323cbb16..0e60bb6f740d7 100644\n--- a/fastapi/security/http.py\n+++ b/fastapi/security/http.py\n@@ -74,7 +74,7 @@ def __init__(\n         scheme_name: str | None = None,\n         description: str | None = None,\n         auto_error: bool = True,\n-    ):\n+    ) -> None:\n         self.model: HTTPBaseModel = HTTPBaseModel(\n             scheme=scheme, description=description\n         )\n@@ -188,7 +188,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         self.model = HTTPBaseModel(scheme=\"basic\", description=description)\n         self.scheme_name = scheme_name or self.__class__.__name__\n         self.realm = realm\n@@ -295,7 +295,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         self.model = HTTPBearerModel(bearerFormat=bearerFormat, description=description)\n         self.scheme_name = scheme_name or self.__class__.__name__\n         self.auto_error = auto_error\n@@ -396,7 +396,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         self.model = HTTPBaseModel(scheme=\"digest\", description=description)\n         self.scheme_name = scheme_name or self.__class__.__name__\n         self.auto_error = auto_error\ndiff --git a/fastapi/security/oauth2.py b/fastapi/security/oauth2.py\nindex 661043ce7b885..653e9867670a7 100644\n--- a/fastapi/security/oauth2.py\n+++ b/fastapi/security/oauth2.py\n@@ -150,7 +150,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = None,\n-    ):\n+    ) -> None:\n         self.grant_type = grant_type\n         self.username = username\n         self.password = password\n@@ -316,7 +316,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = None,\n-    ):\n+    ) -> None:\n         super().__init__(\n             grant_type=grant_type,\n             username=username,\n@@ -391,7 +391,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         self.model = OAuth2Model(\n             flows=cast(OAuthFlowsModel, flows), description=description\n         )\n@@ -513,7 +513,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = None,\n-    ):\n+    ) -> None:\n         if not scopes:\n             scopes = {}\n         flows = OAuthFlowsModel(\n@@ -618,7 +618,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         if not scopes:\n             scopes = {}\n         flows = OAuthFlowsModel(\n@@ -673,7 +673,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = None,\n-    ):\n+    ) -> None:\n         self.scopes: Annotated[\n             list[str],\n             Doc(\ndiff --git a/fastapi/security/open_id_connect_url.py b/fastapi/security/open_id_connect_url.py\nindex 1c6fcc744044a..2384ce0439c39 100644\n--- a/fastapi/security/open_id_connect_url.py\n+++ b/fastapi/security/open_id_connect_url.py\n@@ -70,7 +70,7 @@ def __init__(\n                 \"\"\"\n             ),\n         ] = True,\n-    ):\n+    ) -> None:\n         self.model = OpenIdConnectModel(\n             openIdConnectUrl=openIdConnectUrl, description=description\n         )\n",
+    "human_comments": [
+      {
+        "body": "```\nmypy check...............................................................Failed\n- hook id: local-mypy\n- exit code: 1\n\n  fastapi/dependencies/utils.py:866: error: Argument 1 to \"is_union_of_base_models\" has incompatible type \"type[Any] | None\"; expected \"type\"  [arg-type]\n  Found 1 error in 1 file (checked 47 source files)\n```",
+        "path": "fastapi/dependencies/utils.py",
+        "line": null
+      },
+      {
+        "body": "It's not necessary to specify return type annotation for `__init__` methods.\nIf we want to enforce this, we should enable such rule for linter",
+        "path": "fastapi/security/api_key.py",
+        "line": 19
+      },
+      {
+        "body": "With this syntax, performance decreases.\nSee https://github.com/astral-sh/ruff/issues/7871",
+        "path": "fastapi/dependencies/utils.py",
+        "line": 384
+      },
+      {
+        "body": "I don't think this is necessary. In utils.py we still pass `first_field.field_info.annotation` which is of type `Any`",
+        "path": "fastapi/dependencies/utils.py",
+        "line": 829
+      }
+    ],
+    "pr_type": "feature_or_refactor"
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5831,
+    "title": "Update installation instructions for Windows PowerShell",
+    "body": "Added instructions for enabling PowerShell script execution on Windows.",
+    "merged": false,
+    "diff": "diff --git a/docs/installation.rst b/docs/installation.rst\nindex aed389e62a..dd18c123d4 100644\n--- a/docs/installation.rst\n+++ b/docs/installation.rst\n@@ -129,6 +129,12 @@ Before you work on your project, activate the corresponding environment:\n Your shell prompt will change to show the name of the activated\n environment.\n \n+PowerShell scripts such as the venv activation script are blocked by default in Windows.\n+To fix this, run the Set-ExecutionPolicy command to set the policy to AllSigned or another policy that allows scripts.\n+Learn more at `this Microsoft Learn page <powershell_>`_.\n+\n+.. _powershell: https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy?view=powershell-7.5\n+\n \n Install Flask\n -------------\n",
+    "human_comments": [
+      {
+        "body": "I can't comment on whether this makes sense since I'm, not very familiar with PowerShell, but this line is excessively long compared to any other lines in this file.",
+        "path": "docs/installation.rst",
+        "line": null
+      },
+      {
+        "body": "Made it ever so slightly shorter, but wasn\u2019t quite sure how to shorten it by a large amount",
+        "path": "docs/installation.rst",
+        "line": null
+      },
+      {
+        "body": "I was talking about adding linebreaks, not actually shortening the content ;)",
+        "path": "docs/installation.rst",
+        "line": null
+      },
+      {
+        "body": "Also, being a rst file, links should be correctly marked as links and not just plaintext urls. You can check other links in the same file for examples on how that's done.",
+        "path": "docs/installation.rst",
+        "line": null
+      },
+      {
+        "body": "I\u2019ve added line breaks, but I\u2019ve never used rst before and can\u2019t figure out how to do the links\u2026",
+        "path": "docs/installation.rst",
+        "line": null
+      },
+      {
+        "body": "Figured them out now, I was using the wrong type of apostrophe \ud83e\udd26",
+        "path": "docs/installation.rst",
+        "line": null
+      }
+    ],
+    "pr_type": "feature_or_refactor"
+  }
+]
