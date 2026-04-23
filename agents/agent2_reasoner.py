@@ -26,19 +26,24 @@ You will be given:
 2. A summary of what changed (from a previous analysis step)
 3. Relevant files from the codebase for context
 
-Your job is to reason carefully about whether the changes could cause bugs or performance issues.
-Always analyze the raw diffs directly — do not rely solely on the summary.
+Analyze the raw diffs directly — do not rely solely on the summary.
 
-Focus on:
-- Syntax errors: missing brackets, braces, parentheses, or other structural breaks that would prevent the code from running
-- Bug detection: logic errors, null/undefined handling, off-by-one errors, broken imports, type mismatches
-- Performance issues: unnecessary re-renders, expensive operations in loops, memory leaks, blocking calls
+Surface concerns across these dimensions:
+- Correctness: logic errors, off-by-one, null/undefined handling, type mismatches, broken imports, syntax breaks
+- Performance: expensive work in loops, blocking calls, memory leaks, redundant computation, re-render triggers
+- Design: unclear invariants, hidden coupling, leaking abstractions, API-surface regressions, inconsistent error handling
+- Maintainability: duplicated logic, violations of existing patterns in the same file, confusing control flow, dead code
+- Safety: input validation gaps, unchecked external calls, race conditions, resource leaks
+
+For every finding, explain *why* it matters — the specific scenario where it breaks, the assumption it violates, or the downstream consequence. Root-cause reasoning, not surface observation. Reference exact function names, variable names, or line regions.
+
+Grounding is mandatory. Every finding must include an "evidence" field containing the exact added or removed line from the diff (prefixed with + or -) that proves the finding. If you cannot quote a specific line, do not include the finding. Assign "confidence" of high, medium, or low: high means the evidence line unambiguously demonstrates the issue; low means the issue depends on unseen code or framework behavior you are unsure about.
 
 IMPORTANT:
 - Respond ONLY with valid JSON. No explanation, no markdown, no code fences.
 - If you find no issues, return an empty findings array — do not invent problems.
-- Be specific: reference exact filenames and describe the exact concern.
 - A syntax error that breaks the build is always high severity.
+- Prefer one sharp finding with deep reasoning over three shallow ones.
 """
 
 
@@ -88,11 +93,13 @@ Return this exact JSON structure:
   "findings": [
     {{
       "filename": "path/to/file.ext",
-      "type": "bug | performance",
+      "type": "bug | performance | design | maintainability | safety",
       "severity": "low | medium | high",
+      "confidence": "high | medium | low",
+      "evidence": "the exact +/- line from the diff that proves this finding",
       "title": "Short title for this finding.",
-      "description": "Detailed explanation of the issue and why it matters.",
-      "suggestion": "Concrete suggestion for how to fix or improve it."
+      "description": "Explain the root cause and the concrete scenario where this breaks or degrades the code.",
+      "suggestion": "Concrete, specific fix — reference function/variable names or exact changes to make."
     }}
   ],
   "overall_risk": "low | medium | high",
@@ -132,7 +139,7 @@ def _parse(raw):
     m = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not m:
         raise ValueError(f"No JSON found in model output:\n{raw[:500]}")
-    return json.loads(m.group())
+    return json.loads(m.group(), strict=False)
 
 
 def run_agent2(agent1_summary, context_files, pr_files):
@@ -146,6 +153,70 @@ def run_agent2(agent1_summary, context_files, pr_files):
     user_prompt = _prompt(agent1_summary, context_files, pr_files)
     raw = _call(user_prompt)
     return _parse(raw)
+
+
+VERIFY_SYSTEM = """You verify code review findings against a raw diff. For each finding you receive, decide whether the quoted evidence actually appears in the diff and whether the finding's claim is directly supported by visible diff content.
+
+Keep only findings where both are true:
+1. The evidence line (verbatim or near-verbatim) appears in the diff.
+2. The claim in description follows from code visible in the diff — no reliance on unseen context, framework assumptions, or guesses.
+
+Drop everything else. Do not rewrite findings — only keep or drop.
+
+Respond ONLY with valid JSON. No markdown, no fences.
+"""
+
+
+def _verify_prompt(findings, pr_files):
+    diff_sections = []
+    for f in pr_files:
+        filename = f.get("filename", "unknown")
+        patch = f.get("patch", "")
+        if not patch:
+            continue
+        diff_sections.append(f"FILE: {filename}\nDIFF:\n{patch}")
+    diffs_block = "\n\n---\n\n".join(diff_sections) if diff_sections else "No diff content available."
+
+    return f"""Raw diff:
+{diffs_block}
+
+Candidate findings:
+{json.dumps(findings, indent=2)}
+
+Return only the findings that pass verification, preserving their fields exactly:
+{{
+  "findings": [ ... ]
+}}
+"""
+
+
+def verify_findings(findings, pr_files):
+    if not findings:
+        return []
+    user_prompt = _verify_prompt(findings, pr_files)
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": VERIFY_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=180)
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                continue
+            raise
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        raw = r.json()["choices"][0]["message"]["content"]
+        try:
+            return _parse(raw).get("findings", [])
+        except Exception:
+            return findings
 
 
 if __name__ == "__main__":
