@@ -24,3 +24,12 @@ def upsert(chunks, repo):
 def query(vec, repo, k=5):
     res = idx.query(vector=vec, top_k=k, namespace=repo, include_metadata=True)
     return [{"id": m.id, "score": m.score, **m.metadata} for m in res.matches]
+
+def namespace_count(repo):
+    try:
+        stats = idx.describe_index_stats()
+        ns = stats.get("namespaces", {}) or {}
+        return ns.get(repo, {}).get("vector_count", 0)
+    except Exception as e:
+        print(f"namespace_count({repo}) failed: {e}")
+        return 0
