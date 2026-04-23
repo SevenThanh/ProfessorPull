@@ -11,7 +11,7 @@ if not OR_KEY:
     raise RuntimeError("Missing env var OPENROUTER_API_KEY")
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "qwen/qwen3-coder:free"
+MODEL = "qwen/qwen3-coder"
 
 HEADERS = {
     "Authorization": f"Bearer {OR_KEY}",
