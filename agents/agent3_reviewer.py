@@ -136,6 +136,107 @@ def run_agent3(agent1_summary, agent2_findings):
     return _clean(raw)
 
 
+SYSTEM_PROMPT_COMMENT = """You are a senior engineer leaving a single short inline code review comment on a specific change.
+
+You will be given the raw diff plus an analysis from previous steps. The raw diff is ground truth — if the analysis describes something that is not actually present in the diff, ignore that part of the analysis.
+
+Your comment will be scored on three dimensions:
+- Correctness: identifies real issues actually present in the diff, without inventing problems. Every claim must be traceable to a line visible in the diff.
+- Actionability: a developer can act on it without asking follow-up questions. Concrete, located, fixable — reference exact function or variable names.
+- Depth: goes beyond style nitpicks to logic, design, or architectural concerns. Substantive reasoning about code quality, not surface observation.
+
+Write ONLY the comment text. No headers, sections, verdict line, markdown structure, or preamble. 3 to 5 sentences of plain prose.
+
+Structure the comment to cover, in order:
+1. The specific issue, referenced by function name, variable name, or exact behavior — not "this change" or "the code".
+2. Why it matters — the concrete scenario where it breaks, the assumption it violates, or the downstream effect. This is what makes the comment substantive.
+3. A concrete fix — what to change, not "consider changing".
+
+Rules:
+- Ground every claim in the raw diff. Do not invent symbols, functions, or behaviors that are not visible in the diff.
+- Never use hedging words: "maybe", "perhaps", "possibly", "might want to", "seems like", "I think", "consider".
+- Never restate the diff or describe what you're about to say.
+- Reference code by name (function, variable, condition), not by location words ("this line", "here", "above").
+- If the change is genuinely low-risk, state *what specifically* is safe and *why* in one crisp sentence — still concrete, still substantive.
+- Tone: senior engineer typing a focused inline comment. Direct, grounded, no fluff.
+"""
+
+
+def _prompt_comment(agent1_summary, agent2_findings, raw_diff=""):
+    overall_summary = agent1_summary.get("overall_summary", "No summary available.")
+    overall_change_type = agent1_summary.get("overall_change_type", "unknown")
+
+    findings = agent2_findings.get("findings", [])
+    risk_reasoning = agent2_findings.get("risk_reasoning", "")
+
+    changed_files = agent1_summary.get("changed_files", [])
+    files_block = "\n".join(
+        f"- {f['filename']} ({f['status']}): {f['summary']}"
+        for f in changed_files
+    ) or "- (no files)"
+
+    if findings:
+        findings_block = "\n".join(
+            f"- [{f['severity']}] {f['filename']}: {f['title']} — {f['description']} Suggestion: {f['suggestion']}"
+            for f in findings
+        )
+    else:
+        findings_block = "- (no issues found)"
+
+    diff_block = raw_diff.strip() or "(diff not provided)"
+
+    return f"""Raw diff (ground truth):
+{diff_block}
+
+Analysis from previous steps (use only where it matches the diff):
+Summary: {overall_summary}
+Change type: {overall_change_type}
+
+Files:
+{files_block}
+
+Findings:
+{findings_block}
+
+Reasoning: {risk_reasoning}
+
+Now write the single short review comment, grounded in the raw diff above."""
+
+
+def _clean_comment(raw):
+    s = raw.strip()
+    s = re.sub(r"^```(?:\w+)?\n?", "", s)
+    s = re.sub(r"\n?```$", "", s)
+    s = re.sub(r"^#{1,6}\s.*$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def run_agent3_comment(agent1_summary, agent2_findings, raw_diff=""):
+    user_prompt = _prompt_comment(agent1_summary, agent2_findings, raw_diff)
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_COMMENT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 400,
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                print(f"Agent 3 comment: timeout, retrying ({attempt + 1}/2)...")
+                continue
+            raise
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        return _clean_comment(r.json()["choices"][0]["message"]["content"])
+
+
 if __name__ == "__main__":
     sample_agent1_summary = {
         "changed_files": [
