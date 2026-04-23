@@ -1,0 +1,104 @@
+import os
+import csv
+import asyncio
+import argparse
+from datetime import datetime
+from tqdm import tqdm
+from eval.dataset import load_examples
+from eval import adapters
+from eval.metrics import rouge_l, bleu4
+
+CSV = "eval/results/scores.csv"
+CFGS = {
+    "full_pp": adapters.full_pp,
+    "no_rag": adapters.no_rag,
+    "no_multiagent": adapters.no_multiagent,
+    "baseline": adapters.baseline,
+}
+FIELDS = ["ex_id", "config", "gen", "ref", "rouge_l", "bleu4"]
+
+
+def done():
+    if not os.path.exists(CSV):
+        return set()
+    with open(CSV) as f:
+        return {(int(r["ex_id"]), r["config"]) for r in csv.DictReader(f)}
+
+
+def append(row):
+    new = not os.path.exists(CSV)
+    with open(CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+        f.flush()
+
+
+def _work(name, i, ex):
+    fn = CFGS[name]
+    try:
+        gen = fn(ex)
+        ref = ex["comment"]
+        rl = rouge_l(gen, ref)
+        b4 = bleu4(gen, ref)
+        return gen, ref, rl, b4, None
+    except Exception as e:
+        return "", ex["comment"], 0.0, 0.0, e
+
+
+async def run_one(name, i, ex, sem, lock, bar):
+    async with sem:
+        gen, ref, rl, b4, err = await asyncio.to_thread(_work, name, i, ex)
+    if err is not None:
+        print(f"[{name} ex{i}] ERROR: {err}")
+        with open("eval/results/errors.log", "a") as ef:
+            ef.write(f"{datetime.now().isoformat()}\t{name}\tex{i}\t{type(err).__name__}: {err}\n")
+    async with lock:
+        append({"ex_id": i, "config": name, "gen": gen, "ref": ref, "rouge_l": rl, "bleu4": b4})
+        bar.update(1)
+
+
+async def _main_async(names, exs, skip):
+    sem = asyncio.Semaphore(5)
+    lock = asyncio.Lock()
+    total = len(names) * len(exs)
+    with tqdm(total=total) as bar:
+        tasks = []
+        for name in names:
+            for i, ex in enumerate(exs):
+                if (i, name) in skip:
+                    bar.update(1)
+                    continue
+                tasks.append(run_one(name, i, ex, sem, lock, bar))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--configs", default="full_pp,no_rag,no_multiagent,baseline")
+    p.add_argument("--n", type=int, default=50)
+    args = p.parse_args()
+
+    names = args.configs.split(",")
+    exs = load_examples(n=args.n)
+    skip = done()
+
+    asyncio.run(_main_async(names, exs, skip))
+
+    sums = {}
+    with open(CSV) as f:
+        for r in csv.DictReader(f):
+            c = r["config"]
+            s = sums.setdefault(c, {"rl": 0.0, "b4": 0.0, "n": 0})
+            s["rl"] += float(r["rouge_l"])
+            s["b4"] += float(r["bleu4"])
+            s["n"] += 1
+
+    print(f"\n{'config':<16} {'rouge_l':>10} {'bleu4':>10}  n")
+    for c, s in sums.items():
+        print(f"{c:<16} {s['rl']/s['n']:>10.4f} {s['b4']/s['n']:>10.4f}  {s['n']}")
+
+
+if __name__ == "__main__":
+    main()
