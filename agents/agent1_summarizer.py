@@ -100,7 +100,7 @@ def _parse(raw):
     m = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not m:
         raise ValueError(f"No JSON found in model output:\n{raw[:500]}")
-    return json.loads(m.group())
+    return json.loads(m.group(), strict=False)
 
 
 def run_agent1(pr_files):
