@@ -6,16 +6,15 @@ from datetime import datetime
 from tqdm import tqdm
 from eval.dataset import load_examples
 from eval import adapters
-from eval.metrics import rouge_l, bleu4
 
 CSV = "eval/results/scores.csv"
 CFGS = {
     "full_pp": adapters.full_pp,
-    "no_rag": adapters.no_rag,
+    "gemma": adapters.gemma,
     "no_multiagent": adapters.no_multiagent,
     "baseline": adapters.baseline,
 }
-FIELDS = ["ex_id", "config", "gen", "ref", "rouge_l", "bleu4"]
+FIELDS = ["ex_id", "config", "gen", "ref"]
 
 
 def done():
@@ -40,22 +39,20 @@ def _work(name, i, ex):
     try:
         gen = fn(ex)
         ref = ex["comment"]
-        rl = rouge_l(gen, ref)
-        b4 = bleu4(gen, ref)
-        return gen, ref, rl, b4, None
+        return gen, ref, None
     except Exception as e:
-        return "", ex["comment"], 0.0, 0.0, e
+        return "", ex["comment"], e
 
 
 async def run_one(name, i, ex, sem, lock, bar):
     async with sem:
-        gen, ref, rl, b4, err = await asyncio.to_thread(_work, name, i, ex)
+        gen, ref, err = await asyncio.to_thread(_work, name, i, ex)
     if err is not None:
         print(f"[{name} ex{i}] ERROR: {err}")
         with open("eval/results/errors.log", "a") as ef:
             ef.write(f"{datetime.now().isoformat()}\t{name}\tex{i}\t{type(err).__name__}: {err}\n")
     async with lock:
-        append({"ex_id": i, "config": name, "gen": gen, "ref": ref, "rouge_l": rl, "bleu4": b4})
+        append({"ex_id": i, "config": name, "gen": gen, "ref": ref})
         bar.update(1)
 
 
@@ -86,18 +83,14 @@ def main():
 
     asyncio.run(_main_async(names, exs, skip))
 
-    sums = {}
+    counts = {}
     with open(CSV) as f:
         for r in csv.DictReader(f):
-            c = r["config"]
-            s = sums.setdefault(c, {"rl": 0.0, "b4": 0.0, "n": 0})
-            s["rl"] += float(r["rouge_l"])
-            s["b4"] += float(r["bleu4"])
-            s["n"] += 1
+            counts[r["config"]] = counts.get(r["config"], 0) + 1
 
-    print(f"\n{'config':<16} {'rouge_l':>10} {'bleu4':>10}  n")
-    for c, s in sums.items():
-        print(f"{c:<16} {s['rl']/s['n']:>10.4f} {s['b4']/s['n']:>10.4f}  {s['n']}")
+    print(f"\n{'config':<16} {'n':>6}")
+    for c, n in counts.items():
+        print(f"{c:<16} {n:>6}")
 
 
 if __name__ == "__main__":
