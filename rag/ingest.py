@@ -43,23 +43,29 @@ def chunk(text, max_tok=400):
                 chunks.append(buf)
     return chunks
 
-def run(path, repo):
-    files = load(path)
-    print(f"Loaded {len(files)} files from {path}")
-    kept = [f for f in files if not skip(f["path"])]
-    print(f"Kept {len(kept)} files after filtering")
+def ingest_repo_context(repo_context, repo):
+    files = repo_context.get("files", [])
+    kept = [f for f in files if f.get("content") and not f.get("skipped") and not skip(f["path"])]
+    print(f"Kept {len(kept)} files after filtering (from {len(files)})")
     batch = []
     for f in kept:
         fname = f["path"]
         parts = chunk(f["content"])
         safe = fname.replace("/", "_")
-        print(f"  {fname} -> {len(parts)} chunks")
         for i, txt in enumerate(parts):
             vec = embed(txt, task="document")
             batch.append({"id": f"{repo}__{safe}__{i}", "vec": vec, "text": txt, "filename": fname})
     print(f"Upserting {len(batch)} vectors to namespace '{repo}'")
-    upsert(batch, repo)
-    print("Done.")
+    if batch:
+        upsert(batch, repo)
+    return {"files_ingested": len(kept), "chunks": len(batch)}
+
+
+def run(path, repo):
+    files = load(path)
+    print(f"Loaded {len(files)} files from {path}")
+    summary = ingest_repo_context({"files": files}, repo)
+    print(f"Done. {summary}")
 
 
 if __name__ == "__main__":
