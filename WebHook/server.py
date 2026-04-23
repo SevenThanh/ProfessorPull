@@ -13,12 +13,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import httpx
 import jwt
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 from rag.retrieval import get_context
+from rag.ingest import ingest_repo_context
+from rag.pinecone_db import namespace_count
 from agents.agent1_summarizer import run_agent1
 from agents.agent2_reasoner import run_agent2
 from agents.agent3_reviewer import run_agent3
@@ -336,8 +338,95 @@ def save_repo_context(delivery_id: str | None, context: dict[str, Any], folder: 
     return out_path
 
 
+async def process_pr(owner: str, repo_name: str, full_name: str, pr_number: int, installation_id: int, delivery_id: str | None) -> None:
+    try:
+        installation_token = await get_installation_token(int(installation_id))
+        pr_data = await github_get(f"/repos/{owner}/{repo_name}/pulls/{pr_number}", installation_token)
+        pr_files = await fetch_pr_files(owner, repo_name, int(pr_number), installation_token)
+        head_sha = pr_data.get("head", {}).get("sha")
+        if not head_sha:
+            print(f"[{delivery_id}] Missing PR head SHA; aborting")
+            return
+        repo_context = await fetch_repo_context(owner, repo_name, head_sha, installation_token)
+
+        retrieval_summary = {
+            "repo": full_name,
+            "pr_number": pr_number,
+            "title": pr_data.get("title"),
+            "state": pr_data.get("state"),
+            "changed_files_count": len(pr_files),
+            "head_sha": head_sha,
+            "files": [
+                {
+                    "filename": f.get("filename"),
+                    "status": f.get("status"),
+                    "additions": f.get("additions"),
+                    "deletions": f.get("deletions"),
+                    "changes": f.get("changes"),
+                    "patch": f.get("patch"),
+                    "raw_url": f.get("raw_url"),
+                    "blob_url": f.get("blob_url"),
+                }
+                for f in pr_files
+            ],
+        }
+
+        print(
+            f"[{delivery_id}] Retrieved PR data: changed_files={len(pr_files)} "
+            f"title={pr_data.get('title')!r}"
+        )
+        pr_folder = get_next_pr_folder()
+        saved_path = save_retrieval_summary(delivery_id, retrieval_summary, pr_folder)
+        context_path = save_repo_context(delivery_id, repo_context, pr_folder)
+        print(f"[{delivery_id}] Saved retrieval summary to {saved_path}")
+        print(
+            f"[{delivery_id}] Saved repo context to {context_path} "
+            f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
+        )
+
+        # --- Auto-ingest into Pinecone on first PR for this repo ---
+        if namespace_count(repo_name) == 0:
+            print(
+                f"[{delivery_id}] Pinecone namespace '{repo_name}' empty; "
+                f"ingesting {repo_context.get('fetched_blob_entries')} files..."
+            )
+            try:
+                summary = ingest_repo_context(repo_context, repo_name)
+                print(f"[{delivery_id}] Ingest done: {summary}")
+            except Exception as e:
+                print(f"[{delivery_id}] Ingest failed: {e}")
+        else:
+            print(f"[{delivery_id}] Pinecone namespace '{repo_name}' already populated; skipping ingest")
+
+        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
+        rag_context = get_context(retrieval_summary["files"], repo_name)
+        print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
+
+        # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
+        agent1_summary  = run_agent1(retrieval_summary["files"])
+        agent2_findings = run_agent2(agent1_summary, rag_context, retrieval_summary["files"])
+        review_body     = run_agent3(agent1_summary, agent2_findings)
+
+        # --- Handoff C: Jake → Matt — post the final review to the PR ---
+        try:
+            await post_pr_review(
+                owner=owner,
+                repo=repo_name,
+                pr_number=int(pr_number),
+                token=installation_token,
+                commit_id=head_sha,
+                body=review_body,
+                event="COMMENT",
+            )
+            print(f"[{delivery_id}] Posted review comment to PR #{pr_number}")
+        except HTTPException as exc:
+            print(f"[{delivery_id}] WARNING: Failed to post review comment: {exc.detail}")
+    except Exception as e:
+        print(f"[{delivery_id}] process_pr crashed: {e}")
+
+
 @app.post("/webhook/github")
-async def github_webhook(request: Request):
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
 
     # 1) Verify signature (security)
@@ -374,86 +463,10 @@ async def github_webhook(request: Request):
         if not installation_id or not pr_number or not owner or not repo_name:
             raise HTTPException(status_code=400, detail="Missing required pull request payload fields")
 
-        installation_token = await get_installation_token(int(installation_id))
-        pr_data = await github_get(f"/repos/{owner}/{repo_name}/pulls/{pr_number}", installation_token)
-        pr_files = await fetch_pr_files(owner, repo_name, int(pr_number), installation_token)
-        head_sha = pr_data.get("head", {}).get("sha")
-        if not head_sha:
-            raise HTTPException(status_code=502, detail="Missing PR head SHA")
-        repo_context = await fetch_repo_context(owner, repo_name, head_sha, installation_token)
-
-        retrieval_summary = {
-            "repo": full_name,
-            "pr_number": pr_number,
-            "title": pr_data.get("title"),
-            "state": pr_data.get("state"),
-            "changed_files_count": len(pr_files),
-            "head_sha": head_sha,
-            "files": [
-                {
-                    "filename": f.get("filename"),
-                    "status": f.get("status"),
-                    "additions": f.get("additions"),
-                    "deletions": f.get("deletions"),
-                    "changes": f.get("changes"),
-                    "patch": f.get("patch"),
-                    "raw_url": f.get("raw_url"),
-                    "blob_url": f.get("blob_url"),
-                }
-                for f in pr_files
-            ],
-        }
-
-        print(f"[{delivery_id}] PR event: {full_name} #{pr_number} (installation_id={installation_id}) action={action}")
-        print(
-            f"[{delivery_id}] Retrieved PR data: changed_files={len(pr_files)} "
-            f"title={pr_data.get('title')!r}"
+        print(f"[{delivery_id}] PR event: {full_name} #{pr_number} (installation_id={installation_id}) action={action} — queued")
+        background_tasks.add_task(
+            process_pr, owner, repo_name, full_name, int(pr_number), int(installation_id), delivery_id
         )
-        pr_folder = get_next_pr_folder()
-        saved_path = save_retrieval_summary(delivery_id, retrieval_summary, pr_folder)
-        context_path = save_repo_context(delivery_id, repo_context, pr_folder)
-        print(f"[{delivery_id}] Saved retrieval summary to {saved_path}")
-        print(
-            f"[{delivery_id}] Saved repo context to {context_path} "
-            f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
-        )
-
-        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
-        rag_context = get_context(retrieval_summary["files"], repo_name)
-        print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
-
-        # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
-        agent1_summary  = run_agent1(retrieval_summary["files"])
-        agent2_findings = run_agent2(agent1_summary, rag_context, retrieval_summary["files"])
-        review_body     = run_agent3(agent1_summary, agent2_findings)
-
-        # --- Handoff C: Jake → Matt — post the final review to the PR ---
-        try:
-            await post_pr_review(
-                owner=owner,
-                repo=repo_name,
-                pr_number=int(pr_number),
-                token=installation_token,
-                commit_id=head_sha,
-                body=review_body,
-                event="COMMENT",
-            )
-            print(f"[{delivery_id}] Posted review comment to PR #{pr_number}")
-        except HTTPException as exc:
-            # Don't fail the webhook response just because the comment post failed
-            print(f"[{delivery_id}] WARNING: Failed to post review comment: {exc.detail}")
-
-        return {
-            "ok": True,
-            "retrieval": retrieval_summary,
-            "repo_context": {
-                "head_sha": repo_context.get("ref"),
-                "total_blob_entries": repo_context.get("total_blob_entries"),
-                "fetched_blob_entries": repo_context.get("fetched_blob_entries"),
-                "skipped_files": repo_context.get("skipped_files"),
-                "tree_truncated": repo_context.get("tree_truncated"),
-                "limits": repo_context.get("limits"),
-            },
-        }
+        return {"ok": True, "queued": True, "pr": pr_number}
 
     return {"ok": True, "ignored": True, "event": event}
