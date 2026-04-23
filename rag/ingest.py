@@ -57,7 +57,6 @@ def run(path, repo):
         for i, txt in enumerate(parts):
             vec = embed(txt, task="document")
             batch.append({"id": f"{repo}__{safe}__{i}", "vec": vec, "text": txt, "filename": fname})
-
     print(f"Upserting {len(batch)} vectors to namespace '{repo}'")
     upsert(batch, repo)
     print("Done.")
