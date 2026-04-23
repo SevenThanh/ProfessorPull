@@ -1,18 +1,3 @@
-"""
-Agent 2 — Bug & Performance Reasoner (DeepSeek-V3)
-
-Input:  - agent1_summary: dict output from run_agent1()
-        - context_files: list of relevant files from rag.retrieval.get_context()
-          Each item has: path (str), content (str)
-        - pr_files: raw changed files from the PR (same list passed to Agent 1)
-          Each item has: filename, status, additions, deletions, patch
-
-Output: Structured findings JSON with bugs, performance issues, and risk scores.
-        Passed directly to Agent 3 to write the human review comment.
-
-Calls the Hugging Face Inference API — no local GPU required.
-"""
-
 import os
 import json
 import re
@@ -21,23 +6,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+OR_KEY = os.environ.get("OPENROUTER_API_KEY")
+if not OR_KEY:
+    raise RuntimeError("Missing env var OPENROUTER_API_KEY")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-
-HF_TOKEN = os.environ.get("HF_TOKEN")
-if not HF_TOKEN:
-    raise RuntimeError("Missing env var HF_TOKEN")
-
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-MODEL   = "deepseek-ai/DeepSeek-V3"
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "deepseek/deepseek-v3.2"
 
 HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
+    "Authorization": f"Bearer {OR_KEY}",
     "Content-Type": "application/json",
+    "HTTP-Referer": "https://github.com/SevenThanh/ProfessorPull",
+    "X-Title": "ProfessorPull",
 }
-
-
-# ── Prompt ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a senior software engineer performing a thorough code review.
 You will be given:
@@ -60,15 +41,15 @@ IMPORTANT:
 - A syntax error that breaks the build is always high severity.
 """
 
-def _build_user_prompt(agent1_summary: dict, context_files: list[dict], pr_files: list[dict]) -> str:
-    # Format raw diffs
+
+def _prompt(agent1_summary, context_files, pr_files):
     diff_sections = []
     for f in pr_files:
-        filename  = f.get("filename", "unknown")
-        status    = f.get("status", "modified")
+        filename = f.get("filename", "unknown")
+        status = f.get("status", "modified")
         additions = f.get("additions", 0)
         deletions = f.get("deletions", 0)
-        patch     = f.get("patch", "")
+        patch = f.get("patch", "")
         if not patch:
             continue
         diff_sections.append(
@@ -78,13 +59,11 @@ def _build_user_prompt(agent1_summary: dict, context_files: list[dict], pr_files
         )
     diffs_block = "\n\n---\n\n".join(diff_sections) if diff_sections else "No diff content available."
 
-    # Format Agent 1's summary
     summary_block = json.dumps(agent1_summary, indent=2)
 
-    # Format relevant repo files for context
     file_blocks = []
     for f in context_files:
-        path    = f.get("path", "unknown")
+        path = f.get("path", "unknown")
         content = f.get("content", "")
         if content:
             file_blocks.append(f"FILE: {path}\n```\n{content}\n```")
@@ -125,66 +104,38 @@ Set approved to true only if there are no high severity findings.
 """
 
 
-# ── API Call ───────────────────────────────────────────────────────────────────
-
-def _call_api(user_prompt: str, retries: int = 2) -> str:
+def _call(user_prompt, retries=2):
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 2048,  # Agent 2 needs more tokens than Agent 1 — findings can be verbose
+        "max_tokens": 2048,
     }
-
     for attempt in range(retries + 1):
         try:
-            response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=180)
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=180)
         except requests.exceptions.Timeout:
             if attempt < retries:
                 print(f"Agent 2: request timed out, retrying (attempt {attempt + 1}/{retries})...")
                 continue
             raise
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"HuggingFace API error {response.status_code}: {response.text}"
-            )
-
-        return response.json()["choices"][0]["message"]["content"]
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        return r.json()["choices"][0]["message"]["content"]
 
 
-# ── Output Parsing ─────────────────────────────────────────────────────────────
-
-def _parse_output(raw: str) -> dict:
+def _parse(raw):
     cleaned = re.sub(r"```(?:json)?", "", raw).strip()
-
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if not match:
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not m:
         raise ValueError(f"No JSON found in model output:\n{raw[:500]}")
+    return json.loads(m.group())
 
-    return json.loads(match.group())
 
-
-# ── Public Interface ───────────────────────────────────────────────────────────
-
-def run_agent2(agent1_summary: dict, context_files: list[dict], pr_files: list[dict]) -> dict:
-    """
-    Analyze a PR for bugs and performance issues using DeepSeek-V3.
-
-    Args:
-        agent1_summary: The dict returned by run_agent1(). Contains changed_files,
-                        overall_summary, overall_risk, and flags.
-        context_files:  Relevant files returned by rag.retrieval.get_context().
-                        Each item has: path (str), content (str).
-        pr_files:       Raw changed files from the PR (same list passed to Agent 1).
-                        Each item has: filename, status, additions, deletions, patch.
-
-    Returns:
-        Structured dict with findings, overall_risk, risk_reasoning, and approved.
-        Passed directly to Agent 3 as input.
-    """
+def run_agent2(agent1_summary, context_files, pr_files):
     if not agent1_summary.get("changed_files"):
         return {
             "findings": [],
@@ -192,18 +143,14 @@ def run_agent2(agent1_summary: dict, context_files: list[dict], pr_files: list[d
             "risk_reasoning": "No files were changed.",
             "approved": True,
         }
+    user_prompt = _prompt(agent1_summary, context_files, pr_files)
+    raw = _call(user_prompt)
+    return _parse(raw)
 
-    user_prompt = _build_user_prompt(agent1_summary, context_files, pr_files)
-    raw_output  = _call_api(user_prompt)
-    return _parse_output(raw_output)
-
-
-# ── Quick local test ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json
 
-    # Simulate what Agent 1 would return for the About.jsx change
     sample_agent1_summary = {
         "changed_files": [
             {
@@ -221,7 +168,6 @@ if __name__ == "__main__":
         "flags": []
     }
 
-    # Simulate context returned by rag.retrieval.get_context()
     sample_context_files = [
         {
             "path": "src/components/sections/About.jsx",
@@ -233,7 +179,6 @@ if __name__ == "__main__":
         }
     ]
 
-    # Simulate raw PR files (same format as retrieval_log.txt → retrieval["files"])
     sample_pr_files = [
         {
             "filename": "src/components/sections/About.jsx",
