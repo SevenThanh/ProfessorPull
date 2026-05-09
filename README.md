@@ -1,4 +1,4 @@
-# ProfessorPull
+# TriAgents - iCNS AI Engineering & Science Symposium 
 
 An AI-powered GitHub App that automatically reviews pull requests using a three-agent pipeline backed by RAG (Retrieval-Augmented Generation).
 
