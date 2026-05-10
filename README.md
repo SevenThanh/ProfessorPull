@@ -1,4 +1,4 @@
-# TriAgents - iCNS AI Engineering & Science Symposium 
+# TriAgents - Multi-agents PR Reviewer
 
 An AI-powered GitHub App that automatically reviews pull requests using a three-agent pipeline backed by RAG (Retrieval-Augmented Generation).
 
