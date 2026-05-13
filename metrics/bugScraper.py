@@ -27,7 +27,6 @@ def get_full_pr_details(repo, pr_number):
     url = f"https://api.github.com/repos/{owner}/{name}/pulls/{pr_number}"
     return requests.get(url, headers=HEADERS).json()
 
-# Load your existing test set
 with open(os.path.join(SCRAPED_DIR, "test_set.json"), "r") as f:
     test_set = json.load(f)
 
@@ -39,7 +38,6 @@ bug_prs = []
 non_bug_prs = []
 
 for pr in test_set:
-    # Fetch full details if body is missing (scraper may not have saved it)
     if not pr.get("body"):
         details = get_full_pr_details(pr["repo"], pr["pr_number"])
         pr["body"] = details.get("body", "")

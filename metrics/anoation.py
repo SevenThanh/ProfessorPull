@@ -17,7 +17,7 @@ for pr in bug_prs:
     diff_lines = [l for l in pr["diff"].split("\n") if l.startswith("+") and not l.startswith("+++")]
     pr["lines_added"] = len(diff_lines)
 
-# Split into code-bug PRs (precision/recall) vs docs-bug PRs (ROUGE only)
+# Split into code-bug PRs
 code_bug_prs = [pr for pr in bug_prs if pr["has_code_diff"]]
 docs_bug_prs  = [pr for pr in bug_prs if not pr["has_code_diff"]]
 

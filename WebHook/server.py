@@ -8,7 +8,7 @@ import base64
 import asyncio
 from typing import Any
 
-# Allow imports from the ProfessorPull root (agents/, rag/)
+# Allow imports from the ProfessorPull 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import httpx
@@ -340,24 +340,19 @@ def save_repo_context(delivery_id: str | None, context: dict[str, Any], folder: 
 async def github_webhook(request: Request):
     raw_body = await request.body()
 
-    # 1) Verify signature (security)
     verify_github_signature(raw_body, request.headers.get("X-Hub-Signature-256"))
 
-    # 2) Identify event type
     event = request.headers.get("X-GitHub-Event")
-    delivery_id = request.headers.get("X-GitHub-Delivery")  # useful for idempotency/logging
+    delivery_id = request.headers.get("X-GitHub-Delivery")  
 
-    # 3) Parse JSON payload
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 4) Handle ping (GitHub sends this when you first save the webhook)
     if event == "ping":
         return {"ok": True, "event": "ping"}
 
-    # 5) Handle pull request events
     if event == "pull_request":
         action = payload.get("action")
         if action not in {"opened", "synchronize", "reopened"}:
@@ -418,16 +413,16 @@ async def github_webhook(request: Request):
             f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
         )
 
-        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
+    
         rag_context = get_context(retrieval_summary["files"], repo_name)
         print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
 
-        # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
+    
         agent1_summary  = run_agent1(retrieval_summary["files"])
         agent2_findings = run_agent2(agent1_summary, rag_context, retrieval_summary["files"])
         review_body     = run_agent3(agent1_summary, agent2_findings)
 
-        # --- Handoff C: Jake → Matt — post the final review to the PR ---
+        
         try:
             await post_pr_review(
                 owner=owner,

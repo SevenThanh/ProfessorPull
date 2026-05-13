@@ -46,7 +46,7 @@ def evaluate_on_dataset(prs, system_name, agent_fn):
         try:
             output = agent_fn(diff, pr.get("repo", ""))
         except Exception as e:
-            print(f"    ⚠️  Agent error: {e}")
+            print(f"      Agent error: {e}")
             output = ""
 
         rouge = compute_rouge(output, human_comments)
