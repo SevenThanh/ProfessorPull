@@ -67,7 +67,7 @@ def get_prs_with_reviews(owner, repo, max_prs=10):
             })
 
             print(f"  ✓ PR #{pr_number} — {pr['title'][:60]}")
-            time.sleep(0.5)  # stay under rate limit
+            time.sleep(0.5) 
 
         page += 1
 
@@ -76,10 +76,9 @@ def get_prs_with_reviews(owner, repo, max_prs=10):
 
 # Scrape both repos
 dataset = []
-dataset += get_prs_with_reviews("tiangolo", "fastapi", max_prs=10)
-dataset += get_prs_with_reviews("pallets", "flask", max_prs=10)
+dataset += get_prs_with_reviews("tiangolo", "fastapi", max_prs=50)
+dataset += get_prs_with_reviews("pallets", "flask", max_prs=50)
 
-# Save to file
 os.makedirs(SCRAPED_DIR, exist_ok=True)
 with open(os.path.join(SCRAPED_DIR, "test_set.json"), "w") as f:
     json.dump(dataset, f, indent=2)
