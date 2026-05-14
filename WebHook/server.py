@@ -384,7 +384,7 @@ async def process_pr(owner: str, repo_name: str, full_name: str, pr_number: int,
             f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
         )
 
-        # --- Auto-ingest into Pinecone on first PR for this repo ---
+        
         if namespace_count(repo_name) == 0:
             print(
                 f"[{delivery_id}] Pinecone namespace '{repo_name}' empty; "
@@ -398,7 +398,7 @@ async def process_pr(owner: str, repo_name: str, full_name: str, pr_number: int,
         else:
             print(f"[{delivery_id}] Pinecone namespace '{repo_name}' already populated; skipping ingest")
 
-        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
+        
         rag_context = get_context(retrieval_summary["files"], repo_name)
         print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
 
@@ -429,24 +429,24 @@ async def process_pr(owner: str, repo_name: str, full_name: str, pr_number: int,
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
 
-    # 1) Verify signature (security)
+    
     verify_github_signature(raw_body, request.headers.get("X-Hub-Signature-256"))
 
-    # 2) Identify event type
-    event = request.headers.get("X-GitHub-Event")
-    delivery_id = request.headers.get("X-GitHub-Delivery")  # useful for idempotency/logging
 
-    # 3) Parse JSON payload
+    event = request.headers.get("X-GitHub-Event")
+    delivery_id = request.headers.get("X-GitHub-Delivery")  
+
+    
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 4) Handle ping (GitHub sends this when you first save the webhook)
+    
     if event == "ping":
         return {"ok": True, "event": "ping"}
 
-    # 5) Handle pull request events
+    
     if event == "pull_request":
         action = payload.get("action")
         if action not in {"opened", "synchronize", "reopened"}:
