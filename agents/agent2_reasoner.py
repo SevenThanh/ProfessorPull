@@ -1,18 +1,3 @@
-"""
-Agent 2 — Bug & Performance Reasoner (DeepSeek-V3)
-
-Input:  - agent1_summary: dict output from run_agent1()
-        - context_files: list of relevant files from rag.retrieval.get_context()
-          Each item has: path (str), content (str)
-        - pr_files: raw changed files from the PR (same list passed to Agent 1)
-          Each item has: filename, status, additions, deletions, patch
-
-Output: Structured findings JSON with bugs, performance issues, and risk scores.
-        Passed directly to Agent 3 to write the human review comment.
-
-Calls the Hugging Face Inference API — no local GPU required.
-"""
-
 import os
 import json
 import re
@@ -21,23 +6,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+OR_KEY = os.environ.get("OPENROUTER_API_KEY")
+if not OR_KEY:
+    raise RuntimeError("Missing env var OPENROUTER_API_KEY")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-
-HF_TOKEN = os.environ.get("HF_TOKEN")
-if not HF_TOKEN:
-    raise RuntimeError("Missing env var HF_TOKEN")
-
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-MODEL   = "deepseek-ai/DeepSeek-V3"
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "deepseek/deepseek-v3.2"
 
 HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
+    "Authorization": f"Bearer {OR_KEY}",
     "Content-Type": "application/json",
+    "HTTP-Referer": "https://github.com/SevenThanh/ProfessorPull",
+    "X-Title": "ProfessorPull",
 }
-
-
-# ── Prompt ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a senior software engineer performing a thorough code review.
 You will be given:
@@ -45,30 +26,35 @@ You will be given:
 2. A summary of what changed (from a previous analysis step)
 3. Relevant files from the codebase for context
 
-Your job is to reason carefully about whether the changes could cause bugs or performance issues.
-Always analyze the raw diffs directly — do not rely solely on the summary.
+Analyze the raw diffs directly — do not rely solely on the summary.
 
-Focus on:
-- Syntax errors: missing brackets, braces, parentheses, or other structural breaks that would prevent the code from running
-- Bug detection: logic errors, null/undefined handling, off-by-one errors, broken imports, type mismatches
-- Performance issues: unnecessary re-renders, expensive operations in loops, memory leaks, blocking calls
+Surface concerns across these dimensions:
+- Correctness: logic errors, off-by-one, null/undefined handling, type mismatches, broken imports, syntax breaks
+- Performance: expensive work in loops, blocking calls, memory leaks, redundant computation, re-render triggers
+- Design: unclear invariants, hidden coupling, leaking abstractions, API-surface regressions, inconsistent error handling
+- Maintainability: duplicated logic, violations of existing patterns in the same file, confusing control flow, dead code
+- Safety: input validation gaps, unchecked external calls, race conditions, resource leaks
+
+For every finding, explain *why* it matters — the specific scenario where it breaks, the assumption it violates, or the downstream consequence. Root-cause reasoning, not surface observation. Reference exact function names, variable names, or line regions.
+
+Grounding is mandatory. Every finding must include an "evidence" field containing the exact added or removed line from the diff (prefixed with + or -) that proves the finding. If you cannot quote a specific line, do not include the finding. Assign "confidence" of high, medium, or low: high means the evidence line unambiguously demonstrates the issue; low means the issue depends on unseen code or framework behavior you are unsure about.
 
 IMPORTANT:
 - Respond ONLY with valid JSON. No explanation, no markdown, no code fences.
 - If you find no issues, return an empty findings array — do not invent problems.
-- Be specific: reference exact filenames and describe the exact concern.
 - A syntax error that breaks the build is always high severity.
+- Prefer one sharp finding with deep reasoning over three shallow ones.
 """
 
-def _build_user_prompt(agent1_summary: dict, context_files: list[dict], pr_files: list[dict]) -> str:
-    # Format raw diffs
+
+def _prompt(agent1_summary, context_files, pr_files):
     diff_sections = []
     for f in pr_files:
-        filename  = f.get("filename", "unknown")
-        status    = f.get("status", "modified")
+        filename = f.get("filename", "unknown")
+        status = f.get("status", "modified")
         additions = f.get("additions", 0)
         deletions = f.get("deletions", 0)
-        patch     = f.get("patch", "")
+        patch = f.get("patch", "")
         if not patch:
             continue
         diff_sections.append(
@@ -78,13 +64,11 @@ def _build_user_prompt(agent1_summary: dict, context_files: list[dict], pr_files
         )
     diffs_block = "\n\n---\n\n".join(diff_sections) if diff_sections else "No diff content available."
 
-    # Format Agent 1's summary
     summary_block = json.dumps(agent1_summary, indent=2)
 
-    # Format relevant repo files for context
     file_blocks = []
     for f in context_files:
-        path    = f.get("path", "unknown")
+        path = f.get("path", "unknown")
         content = f.get("content", "")
         if content:
             file_blocks.append(f"FILE: {path}\n```\n{content}\n```")
@@ -109,11 +93,13 @@ Return this exact JSON structure:
   "findings": [
     {{
       "filename": "path/to/file.ext",
-      "type": "bug | performance",
+      "type": "bug | performance | design | maintainability | safety",
       "severity": "low | medium | high",
+      "confidence": "high | medium | low",
+      "evidence": "the exact +/- line from the diff that proves this finding",
       "title": "Short title for this finding.",
-      "description": "Detailed explanation of the issue and why it matters.",
-      "suggestion": "Concrete suggestion for how to fix or improve it."
+      "description": "Explain the root cause and the concrete scenario where this breaks or degrades the code.",
+      "suggestion": "Concrete, specific fix — reference function/variable names or exact changes to make."
     }}
   ],
   "overall_risk": "low | medium | high",
@@ -125,66 +111,38 @@ Set approved to true only if there are no high severity findings.
 """
 
 
-# ── API Call ───────────────────────────────────────────────────────────────────
-
-def _call_api(user_prompt: str, retries: int = 2) -> str:
+def _call(user_prompt, retries=2):
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 2048,  # Agent 2 needs more tokens than Agent 1 — findings can be verbose
+        "max_tokens": 2048,
     }
-
     for attempt in range(retries + 1):
         try:
-            response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=180)
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=180)
         except requests.exceptions.Timeout:
             if attempt < retries:
                 print(f"Agent 2: request timed out, retrying (attempt {attempt + 1}/{retries})...")
                 continue
             raise
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"HuggingFace API error {response.status_code}: {response.text}"
-            )
-
-        return response.json()["choices"][0]["message"]["content"]
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        return r.json()["choices"][0]["message"]["content"]
 
 
-# ── Output Parsing ─────────────────────────────────────────────────────────────
-
-def _parse_output(raw: str) -> dict:
+def _parse(raw):
     cleaned = re.sub(r"```(?:json)?", "", raw).strip()
-
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if not match:
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not m:
         raise ValueError(f"No JSON found in model output:\n{raw[:500]}")
+    return json.loads(m.group(), strict=False)
 
-    return json.loads(match.group())
 
-
-# ── Public Interface ───────────────────────────────────────────────────────────
-
-def run_agent2(agent1_summary: dict, context_files: list[dict], pr_files: list[dict]) -> dict:
-    """
-    Analyze a PR for bugs and performance issues using DeepSeek-V3.
-
-    Args:
-        agent1_summary: The dict returned by run_agent1(). Contains changed_files,
-                        overall_summary, overall_risk, and flags.
-        context_files:  Relevant files returned by rag.retrieval.get_context().
-                        Each item has: path (str), content (str).
-        pr_files:       Raw changed files from the PR (same list passed to Agent 1).
-                        Each item has: filename, status, additions, deletions, patch.
-
-    Returns:
-        Structured dict with findings, overall_risk, risk_reasoning, and approved.
-        Passed directly to Agent 3 as input.
-    """
+def run_agent2(agent1_summary, context_files, pr_files):
     if not agent1_summary.get("changed_files"):
         return {
             "findings": [],
@@ -192,18 +150,78 @@ def run_agent2(agent1_summary: dict, context_files: list[dict], pr_files: list[d
             "risk_reasoning": "No files were changed.",
             "approved": True,
         }
+    user_prompt = _prompt(agent1_summary, context_files, pr_files)
+    raw = _call(user_prompt)
+    return _parse(raw)
 
-    user_prompt = _build_user_prompt(agent1_summary, context_files, pr_files)
-    raw_output  = _call_api(user_prompt)
-    return _parse_output(raw_output)
+
+VERIFY_SYSTEM = """You verify code review findings against a raw diff. For each finding you receive, decide whether the quoted evidence actually appears in the diff and whether the finding's claim is directly supported by visible diff content.
+
+Keep only findings where both are true:
+1. The evidence line (verbatim or near-verbatim) appears in the diff.
+2. The claim in description follows from code visible in the diff — no reliance on unseen context, framework assumptions, or guesses.
+
+Drop everything else. Do not rewrite findings — only keep or drop.
+
+Respond ONLY with valid JSON. No markdown, no fences.
+"""
 
 
-# ── Quick local test ───────────────────────────────────────────────────────────
+def _verify_prompt(findings, pr_files):
+    diff_sections = []
+    for f in pr_files:
+        filename = f.get("filename", "unknown")
+        patch = f.get("patch", "")
+        if not patch:
+            continue
+        diff_sections.append(f"FILE: {filename}\nDIFF:\n{patch}")
+    diffs_block = "\n\n---\n\n".join(diff_sections) if diff_sections else "No diff content available."
+
+    return f"""Raw diff:
+{diffs_block}
+
+Candidate findings:
+{json.dumps(findings, indent=2)}
+
+Return only the findings that pass verification, preserving their fields exactly:
+{{
+  "findings": [ ... ]
+}}
+"""
+
+
+def verify_findings(findings, pr_files):
+    if not findings:
+        return []
+    user_prompt = _verify_prompt(findings, pr_files)
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": VERIFY_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=180)
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                continue
+            raise
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        raw = r.json()["choices"][0]["message"]["content"]
+        try:
+            return _parse(raw).get("findings", [])
+        except Exception:
+            return findings
+
 
 if __name__ == "__main__":
     import json
 
-    # Simulate what Agent 1 would return for the About.jsx change
     sample_agent1_summary = {
         "changed_files": [
             {
@@ -221,7 +239,6 @@ if __name__ == "__main__":
         "flags": []
     }
 
-    # Simulate context returned by rag.retrieval.get_context()
     sample_context_files = [
         {
             "path": "src/components/sections/About.jsx",
@@ -233,7 +250,6 @@ if __name__ == "__main__":
         }
     ]
 
-    # Simulate raw PR files (same format as retrieval_log.txt → retrieval["files"])
     sample_pr_files = [
         {
             "filename": "src/components/sections/About.jsx",

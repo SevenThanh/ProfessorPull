@@ -13,12 +13,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import httpx
 import jwt
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 from rag.retrieval import get_context
+from rag.ingest import ingest_repo_context
+from rag.pinecone_db import namespace_count
 from agents.agent1_summarizer import run_agent1
 from agents.agent2_reasoner import run_agent2
 from agents.agent3_reviewer import run_agent3
@@ -336,45 +338,15 @@ def save_repo_context(delivery_id: str | None, context: dict[str, Any], folder: 
     return out_path
 
 
-@app.post("/webhook/github")
-async def github_webhook(request: Request):
-    raw_body = await request.body()
-
-    verify_github_signature(raw_body, request.headers.get("X-Hub-Signature-256"))
-
-    event = request.headers.get("X-GitHub-Event")
-    delivery_id = request.headers.get("X-GitHub-Delivery")  
-
+async def process_pr(owner: str, repo_name: str, full_name: str, pr_number: int, installation_id: int, delivery_id: str | None) -> None:
     try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    if event == "ping":
-        return {"ok": True, "event": "ping"}
-
-    if event == "pull_request":
-        action = payload.get("action")
-        if action not in {"opened", "synchronize", "reopened"}:
-            return {"ok": True, "ignored": True, "action": action}
-
-        installation_id = payload.get("installation", {}).get("id")
-        pr = payload.get("pull_request", {})
-        pr_number = pr.get("number")
-        repo = payload.get("repository", {})
-        full_name = repo.get("full_name")
-        owner = repo.get("owner", {}).get("login")
-        repo_name = repo.get("name")
-
-        if not installation_id or not pr_number or not owner or not repo_name:
-            raise HTTPException(status_code=400, detail="Missing required pull request payload fields")
-
         installation_token = await get_installation_token(int(installation_id))
         pr_data = await github_get(f"/repos/{owner}/{repo_name}/pulls/{pr_number}", installation_token)
         pr_files = await fetch_pr_files(owner, repo_name, int(pr_number), installation_token)
         head_sha = pr_data.get("head", {}).get("sha")
         if not head_sha:
-            raise HTTPException(status_code=502, detail="Missing PR head SHA")
+            print(f"[{delivery_id}] Missing PR head SHA; aborting")
+            return
         repo_context = await fetch_repo_context(owner, repo_name, head_sha, installation_token)
 
         retrieval_summary = {
@@ -399,7 +371,6 @@ async def github_webhook(request: Request):
             ],
         }
 
-        print(f"[{delivery_id}] PR event: {full_name} #{pr_number} (installation_id={installation_id}) action={action}")
         print(
             f"[{delivery_id}] Retrieved PR data: changed_files={len(pr_files)} "
             f"title={pr_data.get('title')!r}"
@@ -413,7 +384,21 @@ async def github_webhook(request: Request):
             f"(fetched={repo_context.get('fetched_blob_entries')}, skipped={repo_context.get('skipped_files')})"
         )
 
-    
+        # --- Auto-ingest into Pinecone on first PR for this repo ---
+        if namespace_count(repo_name) == 0:
+            print(
+                f"[{delivery_id}] Pinecone namespace '{repo_name}' empty; "
+                f"ingesting {repo_context.get('fetched_blob_entries')} files..."
+            )
+            try:
+                summary = ingest_repo_context(repo_context, repo_name)
+                print(f"[{delivery_id}] Ingest done: {summary}")
+            except Exception as e:
+                print(f"[{delivery_id}] Ingest failed: {e}")
+        else:
+            print(f"[{delivery_id}] Pinecone namespace '{repo_name}' already populated; skipping ingest")
+
+        # --- Handoff A: Matt → Johan — semantic context from Pinecone ---
         rag_context = get_context(retrieval_summary["files"], repo_name)
         print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
 
@@ -435,20 +420,53 @@ async def github_webhook(request: Request):
             )
             print(f"[{delivery_id}] Posted review comment to PR #{pr_number}")
         except HTTPException as exc:
-            # Don't fail the webhook response just because the comment post failed
             print(f"[{delivery_id}] WARNING: Failed to post review comment: {exc.detail}")
+    except Exception as e:
+        print(f"[{delivery_id}] process_pr crashed: {e}")
 
-        return {
-            "ok": True,
-            "retrieval": retrieval_summary,
-            "repo_context": {
-                "head_sha": repo_context.get("ref"),
-                "total_blob_entries": repo_context.get("total_blob_entries"),
-                "fetched_blob_entries": repo_context.get("fetched_blob_entries"),
-                "skipped_files": repo_context.get("skipped_files"),
-                "tree_truncated": repo_context.get("tree_truncated"),
-                "limits": repo_context.get("limits"),
-            },
-        }
+
+@app.post("/webhook/github")
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+    raw_body = await request.body()
+
+    # 1) Verify signature (security)
+    verify_github_signature(raw_body, request.headers.get("X-Hub-Signature-256"))
+
+    # 2) Identify event type
+    event = request.headers.get("X-GitHub-Event")
+    delivery_id = request.headers.get("X-GitHub-Delivery")  # useful for idempotency/logging
+
+    # 3) Parse JSON payload
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # 4) Handle ping (GitHub sends this when you first save the webhook)
+    if event == "ping":
+        return {"ok": True, "event": "ping"}
+
+    # 5) Handle pull request events
+    if event == "pull_request":
+        action = payload.get("action")
+        if action not in {"opened", "synchronize", "reopened"}:
+            return {"ok": True, "ignored": True, "action": action}
+
+        installation_id = payload.get("installation", {}).get("id")
+        pr = payload.get("pull_request", {})
+        pr_number = pr.get("number")
+        repo = payload.get("repository", {})
+        full_name = repo.get("full_name")
+        owner = repo.get("owner", {}).get("login")
+        repo_name = repo.get("name")
+
+        if not installation_id or not pr_number or not owner or not repo_name:
+            raise HTTPException(status_code=400, detail="Missing required pull request payload fields")
+
+        print(f"[{delivery_id}] PR event: {full_name} #{pr_number} (installation_id={installation_id}) action={action} — queued")
+        background_tasks.add_task(
+            process_pr, owner, repo_name, full_name, int(pr_number), int(installation_id), delivery_id
+        )
+        return {"ok": True, "queued": True, "pr": pr_number}
 
     return {"ok": True, "ignored": True, "event": event}
