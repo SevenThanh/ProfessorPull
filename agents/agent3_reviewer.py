@@ -1,15 +1,3 @@
-"""
-Agent 3 — Review Comment Writer (Llama 3.3-70B)
-
-Input:  - agent1_summary: dict output from run_agent1()
-        - agent2_findings: dict output from run_agent2()
-
-Output: A formatted markdown string ready to be posted as a GitHub PR review comment.
-        This is the final human-facing output of the entire pipeline.
-
-Calls the Hugging Face Inference API — no local GPU required.
-"""
-
 import os
 import re
 import requests
@@ -17,23 +5,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+OR_KEY = os.environ.get("OPENROUTER_API_KEY")
+if not OR_KEY:
+    raise RuntimeError("Missing env var OPENROUTER_API_KEY")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-
-HF_TOKEN = os.environ.get("HF_TOKEN")
-if not HF_TOKEN:
-    raise RuntimeError("Missing env var HF_TOKEN")
-
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-MODEL   = "meta-llama/Llama-3.3-70B-Instruct"
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "meta-llama/llama-3.3-70b-instruct"
 
 HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
+    "Authorization": f"Bearer {OR_KEY}",
     "Content-Type": "application/json",
+    "HTTP-Referer": "https://github.com/SevenThanh/ProfessorPull",
+    "X-Title": "ProfessorPull",
 }
-
-
-# ── Prompt ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a senior software engineer writing a formal code review comment on GitHub.
 You will be given a structured analysis of a pull request including what changed and any issues found.
@@ -51,25 +35,24 @@ Guidelines:
 Respond with ONLY the markdown comment text. No preamble, no explanation.
 """
 
-def _build_user_prompt(agent1_summary: dict, agent2_findings: dict) -> str:
-    overall_summary     = agent1_summary.get("overall_summary", "No summary available.")
+
+def _prompt(agent1_summary, agent2_findings):
+    overall_summary = agent1_summary.get("overall_summary", "No summary available.")
     overall_change_type = agent1_summary.get("overall_change_type", "unknown")
-    agent1_risk         = agent1_summary.get("overall_risk", "low")
-    agent1_flags        = agent1_summary.get("flags", [])
+    agent1_risk = agent1_summary.get("overall_risk", "low")
+    agent1_flags = agent1_summary.get("flags", [])
 
-    findings            = agent2_findings.get("findings", [])
-    overall_risk        = agent2_findings.get("overall_risk", "low")
-    risk_reasoning      = agent2_findings.get("risk_reasoning", "")
-    approved            = agent2_findings.get("approved", True)
+    findings = agent2_findings.get("findings", [])
+    overall_risk = agent2_findings.get("overall_risk", "low")
+    risk_reasoning = agent2_findings.get("risk_reasoning", "")
+    approved = agent2_findings.get("approved", True)
 
-    # Format changed files
     changed_files = agent1_summary.get("changed_files", [])
     files_block = "\n".join(
         f"  - {f['filename']} ({f['status']}) — {f['summary']}"
         for f in changed_files
     )
 
-    # Format findings
     if findings:
         findings_block = "\n\n".join(
             f"  Finding #{i+1}:\n"
@@ -84,7 +67,6 @@ def _build_user_prompt(agent1_summary: dict, agent2_findings: dict) -> str:
     else:
         findings_block = "  No issues found."
 
-    # Format Agent 1 flags
     flags_block = "\n".join(f"  - {flag}" for flag in agent1_flags) if agent1_flags else "  None."
 
     verdict = "APPROVED" if approved else "CHANGES REQUESTED"
@@ -116,79 +98,146 @@ Format it clearly with sections for: Overview, Changes, Findings (if any), and V
 """
 
 
-# ── API Call ───────────────────────────────────────────────────────────────────
-
-def _call_api(user_prompt: str, retries: int = 2) -> str:
+def _call(user_prompt, retries=2):
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.3,   # Slightly higher than Agents 1 & 2 — we want natural writing, not rigid JSON
+        "temperature": 0.3,
         "max_tokens": 1024,
     }
-
     for attempt in range(retries + 1):
         try:
-            response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
         except requests.exceptions.Timeout:
             if attempt < retries:
                 print(f"Agent 3: request timed out, retrying (attempt {attempt + 1}/{retries})...")
                 continue
             raise
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"HuggingFace API error {response.status_code}: {response.text}"
-            )
-
-        return response.json()["choices"][0]["message"]["content"]
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        return r.json()["choices"][0]["message"]["content"]
 
 
-# ── Light cleanup ──────────────────────────────────────────────────────────────
-
-def _clean_output(raw: str) -> str:
-    """
-    Strip any accidental preamble the model adds before the markdown.
-    e.g. "Here is the review comment:" or "Sure! Here's the formatted review:"
-    """
+def _clean(raw):
     lines = raw.strip().splitlines()
-
-    # Drop leading lines that don't look like markdown
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("#") or stripped.startswith("##") or stripped.startswith("**"):
             return "\n".join(lines[i:])
-
     return raw.strip()
 
 
-# ── Public Interface ───────────────────────────────────────────────────────────
-
-def run_agent3(agent1_summary: dict, agent2_findings: dict) -> str:
-    """
-    Write a formatted GitHub PR review comment using Llama 3.3-70B.
-
-    Args:
-        agent1_summary:  The dict returned by run_agent1(). Contains changed_files,
-                         overall_summary, overall_change_type, overall_risk, flags.
-        agent2_findings: The dict returned by run_agent2(). Contains findings,
-                         overall_risk, risk_reasoning, approved.
-
-    Returns:
-        A markdown string ready to be passed directly to Matt's post_pr_review()
-        as the `body` parameter.
-    """
-    user_prompt = _build_user_prompt(agent1_summary, agent2_findings)
-    raw_output  = _call_api(user_prompt)
-    return _clean_output(raw_output)
+def run_agent3(agent1_summary, agent2_findings):
+    user_prompt = _prompt(agent1_summary, agent2_findings)
+    raw = _call(user_prompt)
+    return _clean(raw)
 
 
-# ── Quick local test ───────────────────────────────────────────────────────────
+SYSTEM_PROMPT_COMMENT = """You are a senior engineer leaving a single short inline code review comment on a specific change.
+
+You will be given the raw diff plus an analysis from previous steps. The raw diff is ground truth — if the analysis describes something that is not actually present in the diff, ignore that part of the analysis.
+
+Your comment will be scored on three dimensions:
+- Correctness: identifies real issues actually present in the diff, without inventing problems. Every claim must be traceable to a line visible in the diff.
+- Actionability: a developer can act on it without asking follow-up questions. Concrete, located, fixable — reference exact function or variable names.
+- Depth: goes beyond style nitpicks to logic, design, or architectural concerns. Substantive reasoning about code quality, not surface observation.
+
+Write ONLY the comment text. No headers, sections, verdict line, markdown structure, or preamble. 3 to 5 sentences of plain prose.
+
+Structure the comment to cover, in order:
+1. The specific issue, referenced by function name, variable name, or exact behavior — not "this change" or "the code".
+2. Why it matters — the concrete scenario where it breaks, the assumption it violates, or the downstream effect. This is what makes the comment substantive.
+3. A concrete fix — what to change, not "consider changing".
+
+Rules:
+- Ground every claim in the raw diff. Do not invent symbols, functions, or behaviors that are not visible in the diff.
+- Never use hedging words: "maybe", "perhaps", "possibly", "might want to", "seems like", "I think", "consider".
+- Never restate the diff or describe what you're about to say.
+- Reference code by name (function, variable, condition), not by location words ("this line", "here", "above").
+- If the change is genuinely low-risk, state *what specifically* is safe and *why* in one crisp sentence — still concrete, still substantive.
+- Tone: senior engineer typing a focused inline comment. Direct, grounded, no fluff.
+"""
+
+
+def _prompt_comment(agent1_summary, agent2_findings, raw_diff=""):
+    overall_summary = agent1_summary.get("overall_summary", "No summary available.")
+    overall_change_type = agent1_summary.get("overall_change_type", "unknown")
+
+    findings = agent2_findings.get("findings", [])
+    risk_reasoning = agent2_findings.get("risk_reasoning", "")
+
+    changed_files = agent1_summary.get("changed_files", [])
+    files_block = "\n".join(
+        f"- {f['filename']} ({f['status']}): {f['summary']}"
+        for f in changed_files
+    ) or "- (no files)"
+
+    if findings:
+        findings_block = "\n".join(
+            f"- [{f['severity']}] {f['filename']}: {f['title']} — {f['description']} Suggestion: {f['suggestion']}"
+            for f in findings
+        )
+    else:
+        findings_block = "- (no issues found)"
+
+    diff_block = raw_diff.strip() or "(diff not provided)"
+
+    return f"""Raw diff (ground truth):
+{diff_block}
+
+Analysis from previous steps (use only where it matches the diff):
+Summary: {overall_summary}
+Change type: {overall_change_type}
+
+Files:
+{files_block}
+
+Findings:
+{findings_block}
+
+Reasoning: {risk_reasoning}
+
+Now write the single short review comment, grounded in the raw diff above."""
+
+
+def _clean_comment(raw):
+    s = raw.strip()
+    s = re.sub(r"^```(?:\w+)?\n?", "", s)
+    s = re.sub(r"\n?```$", "", s)
+    s = re.sub(r"^#{1,6}\s.*$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def run_agent3_comment(agent1_summary, agent2_findings, raw_diff=""):
+    user_prompt = _prompt_comment(agent1_summary, agent2_findings, raw_diff)
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_COMMENT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 400,
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=120)
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                print(f"Agent 3 comment: timeout, retrying ({attempt + 1}/2)...")
+                continue
+            raise
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenRouter API error {r.status_code}: {r.text}")
+        return _clean_comment(r.json()["choices"][0]["message"]["content"])
+
 
 if __name__ == "__main__":
-    # Simulate Agent 1 output
     sample_agent1_summary = {
         "changed_files": [
             {
@@ -206,7 +255,6 @@ if __name__ == "__main__":
         "flags": []
     }
 
-    # Simulate Agent 2 output
     sample_agent2_findings = {
         "findings": [],
         "overall_risk": "low",
