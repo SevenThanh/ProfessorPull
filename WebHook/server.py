@@ -8,7 +8,7 @@ import base64
 import asyncio
 from typing import Any
 
-# Allow imports from the ProfessorPull root (agents/, rag/)
+# Allow imports from the ProfessorPull 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import httpx
@@ -402,12 +402,12 @@ async def process_pr(owner: str, repo_name: str, full_name: str, pr_number: int,
         rag_context = get_context(retrieval_summary["files"], repo_name)
         print(f"[{delivery_id}] RAG returned {len(rag_context)} context chunks")
 
-        # --- Handoff B: Johan + Matt → Jake — run the three-agent pipeline ---
+    
         agent1_summary  = run_agent1(retrieval_summary["files"])
         agent2_findings = run_agent2(agent1_summary, rag_context, retrieval_summary["files"])
         review_body     = run_agent3(agent1_summary, agent2_findings)
 
-        # --- Handoff C: Jake → Matt — post the final review to the PR ---
+        
         try:
             await post_pr_review(
                 owner=owner,
