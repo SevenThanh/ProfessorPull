@@ -1,5 +1,8 @@
 # TriAgents - Multi-agents PR Reviewer
 
+<img width="625" height="469" alt="Screenshot 2026-05-26 at 3 31 43 PM" src="https://github.com/user-attachments/assets/142b17e4-3a2b-483c-a20c-79a03e081d23" />
+
+
 An AI-powered GitHub App that automatically reviews pull requests using a three-agent pipeline backed by RAG (Retrieval-Augmented Generation).
 
 When a PR is opened or updated, ProfessorPull fetches the diff, retrieves semantically relevant context from the repository via Pinecone, runs three specialized AI agents in sequence, and posts a structured code review comment directly to the PR.
