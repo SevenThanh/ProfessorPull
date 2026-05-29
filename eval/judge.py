@@ -9,7 +9,7 @@ from tqdm import tqdm
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 if not os.environ.get("ANTHROPIC_API_KEY"):
     raise RuntimeError("Missing env var ANTHROPIC_API_KEY")
