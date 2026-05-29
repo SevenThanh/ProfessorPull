@@ -1,8 +1,11 @@
-# ProfessorPull
+# TriAgents - Multi-agents PR Reviewer
+
+<img width="625" height="469" alt="Screenshot 2026-05-26 at 3 31 43 PM" src="https://github.com/user-attachments/assets/142b17e4-3a2b-483c-a20c-79a03e081d23" />
+
 
 An AI-powered GitHub App that automatically reviews pull requests using a three-agent pipeline backed by RAG (Retrieval-Augmented Generation).
 
-When a PR is opened or updated, ProfessorPull fetches the diff, retrieves semantically relevant context from the repository via Pinecone, runs three specialized AI agents in sequence, and posts a structured code review comment directly to the PR.
+When a PR is opened or updated, TriAgents fetches the diff, retrieves semantically relevant context from the repository via Pinecone, runs three specialized AI agents in sequence, and posts a structured code review comment directly to the PR.
 
 ## How It Works
 
@@ -16,39 +19,45 @@ PR opened/updated
   RAG Retrieval  ──── Pinecone (semantic search over repo)
        │
        ▼
-  Agent 1: Diff Summarizer (Qwen2.5-Coder-32B)
+  Agent 1: Diff Summarizer (Qwen3-Coder)
   → Produces structured JSON summary of what changed
        │
        ▼
-  Agent 2: Bug & Performance Reasoner (DeepSeek-V3)
+  Agent 2: Bug & Performance Reasoner (DeepSeek-V3.2)
   → Identifies bugs, syntax errors, and performance issues
        │
        ▼
-  Agent 3: Review Comment Writer (Llama 3.3-70B)
+  Agent 3: Review Comment Writer (Llama 3.3 70B)
   → Synthesizes findings into a formatted GitHub PR comment
        │
        ▼
   GitHub PR Review posted
 ```
 
-All three models are called via the HuggingFace Inference API — no local GPU required.
+All three agents are called via the [OpenRouter](https://openrouter.ai/) API — no local GPU required. Embeddings for RAG use OpenAI `text-embedding-3-small` (768-dim).
 
 ## Project Structure
 
 ```
 ProfessorPull/
 ├── WebHook/
-│   └── server.py           # FastAPI webhook server (GitHub App entrypoint)
+│   └── server.py             # FastAPI webhook server (GitHub App entrypoint)
 ├── agents/
-│   ├── agent1_summarizer.py  # Diff summarizer — Qwen2.5-Coder-32B
-│   ├── agent2_reasoner.py    # Bug/perf reasoner — DeepSeek-V3
-│   └── agent3_reviewer.py    # Review writer — Llama 3.3-70B
-└── rag/
-    ├── embeddings.py         # Gemini embedding-001 via Google Generative AI
-    ├── ingest.py             # Chunk and upsert repo files into Pinecone
-    ├── pinecone_db.py        # Pinecone client (upsert + query)
-    ├── pipeline.py           # Convenience wrapper for the full pipeline
-    └── retrieval.py          # Query Pinecone with patch embeddings
+│   ├── agent1_summarizer.py  # Diff summarizer — Qwen3-Coder
+│   ├── agent2_reasoner.py    # Bug/perf reasoner — DeepSeek-V3.2
+│   └── agent3_reviewer.py    # Review writer — Llama 3.3 70B
+├── rag/
+│   ├── embeddings.py         # OpenAI text-embedding-3-small (768-dim)
+│   ├── ingest.py             # Chunk and upsert repo files into Pinecone
+│   ├── pinecone_db.py        # Pinecone client (upsert + query)
+│   ├── pipeline.py           # Convenience wrapper for the full pipeline
+│   └── retrieval.py          # Query Pinecone with patch embeddings
+└── eval/
+    ├── dataset.py            # Load the Zenodo Comment_Generation benchmark
+    ├── adapters.py           # Pipeline configs (full_pp, no_rag, baselines)
+    ├── run_eval.py           # Generate reviews for each config
+    ├── judge.py              # Score reviews with Claude Haiku 4.5
+    └── stats.py              # Paired bootstrap confidence intervals
 ```
 
 ## Setup
@@ -71,17 +80,20 @@ GITHUB_APP_ID=your_app_id
 GITHUB_WEBHOOK_SECRET=your_webhook_secret
 GITHUB_PRIVATE_KEY_PATH=path/to/your-private-key.pem
 
-# HuggingFace (for all three agents)
-HF_TOKEN=your_huggingface_token
+# OpenRouter (for all three agents)
+OPENROUTER_API_KEY=your_openrouter_key
 
-# Google Generative AI (for embeddings)
-GEMINI_API_KEY=your_gemini_api_key
+# OpenAI (for RAG embeddings)
+OPENAI_API_KEY=your_openai_key
 
 # Pinecone (for RAG)
 PINECONE_API_KEY=your_pinecone_api_key
 
+# Anthropic (only needed to run the evaluation judge)
+ANTHROPIC_API_KEY=your_anthropic_key
+
 # Optional tuning
-MAX_CONTEXT_FILES=300        # Max repo files to include in context
+MAX_CONTEXT_FILES=300          # Max repo files to include in context
 MAX_CONTEXT_FILE_BYTES=200000  # Max file size to fetch
 ```
 
@@ -94,19 +106,17 @@ MAX_CONTEXT_FILE_BYTES=200000  # Max file size to fetch
 5. Subscribe to **Pull request** events
 6. Install the app on the repositories you want reviewed
 
-### 4. Ingest a repository into Pinecone (RAG setup)
-
-Before reviews can use semantic context, ingest a repository's file tree into Pinecone. This uses the `repo_context_log.txt` file saved by the webhook on first run:
-
-```bash
-python -m rag.ingest WebHook/logs/pr_1/repo_context_log.txt --repo your-repo-name
-```
-
-### 5. Run the webhook server
+### 4. Run the webhook server
 
 ```bash
 cd WebHook
 uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+The first time a PR arrives for a repo, TriAgents automatically ingests that repo's file tree into Pinecone — no manual ingest step is required. To re-index a repo manually, you can still run:
+
+```bash
+python -m rag.ingest path/to/repo_context_log.txt --repo your-repo-name
 ```
 
 For local development, use a tunneling tool like [ngrok](https://ngrok.com/) to expose the server to GitHub.
@@ -115,9 +125,9 @@ For local development, use a tunneling tool like [ngrok](https://ngrok.com/) to 
 
 | Agent | Model | Role | Output |
 |-------|-------|------|--------|
-| Agent 1 | Qwen2.5-Coder-32B | Diff Summarizer | Structured JSON: change types, risk levels, flags |
-| Agent 2 | DeepSeek-V3 | Bug & Perf Reasoner | Structured JSON: findings, severity, suggestions |
-| Agent 3 | Llama 3.3-70B | Review Writer | Formatted GitHub markdown PR comment |
+| Agent 1 | Qwen3-Coder | Diff Summarizer | Structured JSON: change types, risk levels, flags |
+| Agent 2 | DeepSeek-V3.2 | Bug & Perf Reasoner | Structured JSON: findings, severity, suggestions |
+| Agent 3 | Llama 3.3 70B | Review Writer | Formatted GitHub markdown PR comment |
 
 Each agent can be tested independently by running its module directly:
 
@@ -127,12 +137,23 @@ python -m agents.agent2_reasoner
 python -m agents.agent3_reviewer
 ```
 
+## Evaluation
+
+TriAgents is benchmarked on 200 real PRs from the Zenodo Comment_Generation dataset. Each generated review is scored 1–5 on correctness, actionability, and depth by a reference-free Claude Haiku 4.5 judge. The harness supports per-component ablation (e.g. `full_pp` with RAG vs. `no_rag`) and reports paired bootstrap confidence intervals so improvements are tested for significance rather than read off point estimates.
+
+```bash
+python -m eval.run_eval --configs full_pp,no_rag --n 200   # generate reviews
+python -m eval.judge                                       # score with Claude Haiku 4.5
+python -m eval.stats                                       # paired bootstrap CIs
+```
+
 ## Dependencies
 
 - `fastapi` + `uvicorn` — webhook server
 - `httpx` — async GitHub API calls
 - `PyJWT[crypto]` — GitHub App JWT authentication
-- `requests` — HuggingFace API calls
+- `requests` — OpenRouter API calls
 - `python-dotenv` — environment variable loading
-- `google-generativeai` — Gemini embeddings
+- `openai` — embeddings (RAG)
 - `pinecone` — vector database for RAG
+- `anthropic` — Claude Haiku judge (evaluation only)
