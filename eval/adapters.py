@@ -5,6 +5,7 @@ from openai import OpenAI
 from agents.agent1_summarizer import run_agent1
 from agents.agent2_reasoner import run_agent2, verify_findings
 from agents.agent3_reviewer import run_agent3, run_agent3_comment
+from eval.retrieval_local import retrieve
 
 OR_KEY = os.environ["OPENROUTER_API_KEY"]
 _oai = OpenAI()
@@ -34,12 +35,20 @@ def to_files(ex):
 
 def full_pp(ex):
     files = to_files(ex)
-    src = ex["old_file"] or ""
-    if len(src) > 12000:
-        src = src[:12000]
-    ctx = [{"path": "source", "content": src}] if src else []
+    chunks = retrieve(ex["old_file"] or "", ex["diff_hunk"], k=5)
+    ctx = [{"path": "ctx", "content": c} for c in chunks]
     s = run_agent1(files)
     f = run_agent2(s, ctx, files)
+    kept = verify_findings(f.get("findings", []), files)
+    kept = [x for x in kept if x.get("confidence", "high") != "low"]
+    f["findings"] = kept
+    return run_agent3_comment(s, f, ex["diff_hunk"])
+
+
+def no_rag(ex):
+    files = to_files(ex)
+    s = run_agent1(files)
+    f = run_agent2(s, [], files)
     kept = verify_findings(f.get("findings", []), files)
     kept = [x for x in kept if x.get("confidence", "high") != "low"]
     f["findings"] = kept
@@ -130,7 +139,7 @@ if __name__ == "__main__":
     ex = load_examples()[0]
     print("=== ref ===")
     print(ex["comment"])
-    for name, fn in [("full_pp", full_pp), ("gemma", gemma), ("no_multiagent", no_multiagent), ("baseline", baseline)]:
+    for name, fn in [("full_pp", full_pp), ("no_rag", no_rag), ("gemma", gemma), ("no_multiagent", no_multiagent), ("baseline", baseline)]:
         print(f"\n=== {name} ===")
         try:
             print(fn(ex))
