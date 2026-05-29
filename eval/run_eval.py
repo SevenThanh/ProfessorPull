@@ -10,10 +10,12 @@ from eval import adapters
 CSV = "eval/results/scores.csv"
 CFGS = {
     "full_pp": adapters.full_pp,
+    "no_rag": adapters.no_rag,
     "gemma": adapters.gemma,
     "no_multiagent": adapters.no_multiagent,
     "baseline": adapters.baseline,
 }
+JUDGE = "eval/results/judge.csv"
 FIELDS = ["ex_id", "config", "gen", "ref"]
 
 
@@ -32,6 +34,23 @@ def append(row):
             w.writeheader()
         w.writerow(row)
         f.flush()
+
+
+def fresh(configs):
+    drop = set(configs)
+    for path in (CSV, JUDGE):
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            r = csv.DictReader(f)
+            fields = r.fieldnames
+            rows = [row for row in r if row["config"] not in drop]
+        os.replace(path, path + ".bak")
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(rows)
+    print(f"Dropped configs {sorted(drop)} (backed up to .bak)")
 
 
 def _work(name, i, ex):
@@ -73,11 +92,14 @@ async def _main_async(names, exs, skip):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--configs", default="full_pp,no_rag,no_multiagent,baseline")
+    p.add_argument("--configs", default="full_pp,no_rag,gemma,no_multiagent,baseline")
     p.add_argument("--n", type=int, default=50)
+    p.add_argument("--fresh", default="")
     args = p.parse_args()
 
     names = args.configs.split(",")
+    if args.fresh:
+        fresh(args.fresh.split(","))
     exs = load_examples(n=args.n)
     skip = done()
 
