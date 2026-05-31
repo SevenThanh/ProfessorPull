@@ -29,4 +29,6 @@ coverage/
 *.zip
 eval/results/*.bak*
 eval/results/comment_gen.zip
+eval/results/examples*.json
+eval/results/scores.csv
 repo_context_log.txt
