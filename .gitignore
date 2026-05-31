@@ -25,7 +25,8 @@ coverage/
 .DS_Store
 .vscode/
 .idea/
-professor-pull.2026-02-18.private-key.pem
+*.pem
+*.zip
 eval/results/*.bak*
 eval/results/comment_gen.zip
 repo_context_log.txt

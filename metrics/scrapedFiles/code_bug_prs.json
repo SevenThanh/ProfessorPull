@@ -1,0 +1,627 @@
+[
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 15139,
+    "title": "\u2b06\ufe0f Increase lower bound to `pydantic >=2.9.0.` and fix the test suite",
+    "body": "Our CI is intended to test the lowest ranges of our dependency pins as well as the highest, but it turns out this wasn't actually working well for Pydantic, and our lowest \"supported\" version wasn't actually being tested. Cf more digging by Yurii [here](https://github.com/fastapi/fastapi/pull/15101#discussion_r2943355570).\r\n\r\nThis PR ensures that the lowest Pydantic supported version is installed when we're testing the lower bounds. From the first commit on this PR, you can see that it fails for the current `master`, which means that we weren't actually supporting the lower versions included in our dependency range.\r\n\r\nSome of the issues include:\r\n* AttributeError: Config has no attribute `val_json_bytes` (only introduced in Pydantic 2.9) \r\n   * This is easily fixed by bumping to lower bound 2.9, solving most issues in one sweep\r\n* Comparison assert failures in `test_schema_pydantic.v2.py`.\r\n   * One is caused by `additionalProperties` being set to `True` always since [Pydantic 2.11](https://github.com/pydantic/pydantic/releases/tag/v2.11.0b1)\r\n   * Bumping to lower bound 2.11 feels a bit much right now, so I've opted to fix these tests instead, allowing multiple versions of the schema.",
+    "merged": true,
+    "diff": "diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml\nindex 2e39633a0c58a..e852e0f25d3b0 100644\n--- a/.github/workflows/test.yml\n+++ b/.github/workflows/test.yml\n@@ -102,6 +102,9 @@ jobs:\n             uv.lock\n       - name: Install Dependencies\n         run: uv sync --no-dev --group tests --extra all\n+      - name: Ensure that we have the lowest supported Pydantic version\n+        if: matrix.uv-resolution == 'lowest-direct'\n+        run: uv pip install \"pydantic==2.9.0\"\n       - name: Install Starlette from source\n         if: matrix.starlette-src == 'starlette-git'\n         run: uv pip install \"git+https://github.com/Kludex/starlette@main\"\ndiff --git a/pyproject.toml b/pyproject.toml\nindex 73d3929292b6f..612d8a0d8abd1 100644\n--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -43,7 +43,7 @@ classifiers = [\n ]\n dependencies = [\n     \"starlette>=0.46.0\",\n-    \"pydantic>=2.7.0\",\n+    \"pydantic>=2.9.0\",\n     \"typing-extensions>=4.8.0\",\n     \"typing-inspection>=0.4.2\",\n     \"annotated-doc>=0.0.2\",\n@@ -156,7 +156,7 @@ docs-tests = [\n ]\n github-actions = [\n     \"httpx >=0.27.0,<1.0.0\",\n-    \"pydantic >=2.5.3,<3.0.0\",\n+    \"pydantic >=2.9.0,<3.0.0\",\n     \"pydantic-settings >=2.1.0,<3.0.0\",\n     \"pygithub >=2.3.0,<3.0.0\",\n     \"pyyaml >=5.3.1,<7.0.0\",\ndiff --git a/tests/test_schema_compat_pydantic_v2.py b/tests/test_schema_compat_pydantic_v2.py\nindex 737687f2560d8..7612c6ab5ba12 100644\n--- a/tests/test_schema_compat_pydantic_v2.py\n+++ b/tests/test_schema_compat_pydantic_v2.py\n@@ -1,4 +1,5 @@\n import pytest\n+from dirty_equals import IsOneOf\n from fastapi import FastAPI\n from fastapi.testclient import TestClient\n from inline_snapshot import snapshot\n@@ -63,28 +64,58 @@ def test_openapi_schema(client: TestClient):\n                 }\n             },\n             \"components\": {\n-                \"schemas\": {\n-                    \"PlatformRole\": {\n-                        \"type\": \"string\",\n-                        \"enum\": [\"admin\", \"user\"],\n-                        \"title\": \"PlatformRole\",\n+                \"schemas\": IsOneOf(\n+                    # Pydantic >= 2.11: no top-level OtherRole\n+                    {\n+                        \"PlatformRole\": {\n+                            \"type\": \"string\",\n+                            \"enum\": [\"admin\", \"user\"],\n+                            \"title\": \"PlatformRole\",\n+                        },\n+                        \"User\": {\n+                            \"properties\": {\n+                                \"username\": {\"type\": \"string\", \"title\": \"Username\"},\n+                                \"role\": {\n+                                    \"anyOf\": [\n+                                        {\"$ref\": \"#/components/schemas/PlatformRole\"},\n+                                        {\"enum\": [], \"title\": \"OtherRole\"},\n+                                    ],\n+                                    \"title\": \"Role\",\n+                                },\n+                            },\n+                            \"type\": \"object\",\n+                            \"required\": [\"username\", \"role\"],\n+                            \"title\": \"User\",\n+                        },\n                     },\n-                    \"User\": {\n-                        \"properties\": {\n-                            \"username\": {\"type\": \"string\", \"title\": \"Username\"},\n-                            \"role\": {\n-                                \"anyOf\": [\n-                                    {\"$ref\": \"#/components/schemas/PlatformRole\"},\n-                                    {\"enum\": [], \"title\": \"OtherRole\"},\n-                                ],\n-                                \"title\": \"Role\",\n+                    # Pydantic < 2.11: adds a top-level OtherRole schema\n+                    {\n+                        \"OtherRole\": {\n+                            \"enum\": [],\n+                            \"title\": \"OtherRole\",\n+                        },\n+                        \"PlatformRole\": {\n+                            \"type\": \"string\",\n+                            \"enum\": [\"admin\", \"user\"],\n+                            \"title\": \"PlatformRole\",\n+                        },\n+                        \"User\": {\n+                            \"properties\": {\n+                                \"username\": {\"type\": \"string\", \"title\": \"Username\"},\n+                                \"role\": {\n+                                    \"anyOf\": [\n+                                        {\"$ref\": \"#/components/schemas/PlatformRole\"},\n+                                        {\"enum\": [], \"title\": \"OtherRole\"},\n+                                    ],\n+                                    \"title\": \"Role\",\n+                                },\n                             },\n+                            \"type\": \"object\",\n+                            \"required\": [\"username\", \"role\"],\n+                            \"title\": \"User\",\n                         },\n-                        \"type\": \"object\",\n-                        \"required\": [\"username\", \"role\"],\n-                        \"title\": \"User\",\n                     },\n-                }\n+                )\n             },\n         }\n     )\ndiff --git a/tests/test_union_body_discriminator.py b/tests/test_union_body_discriminator.py\nindex 1b682c7751f94..53350abc0641a 100644\n--- a/tests/test_union_body_discriminator.py\n+++ b/tests/test_union_body_discriminator.py\n@@ -1,5 +1,6 @@\n from typing import Annotated, Any, Literal\n \n+from dirty_equals import IsOneOf\n from fastapi import FastAPI\n from fastapi.testclient import TestClient\n from inline_snapshot import snapshot\n@@ -88,11 +89,19 @@ def save_union_body_discriminator(\n                                 \"description\": \"Successful Response\",\n                                 \"content\": {\n                                     \"application/json\": {\n-                                        \"schema\": {\n-                                            \"type\": \"object\",\n-                                            \"additionalProperties\": True,\n-                                            \"title\": \"Response Save Union Body Discriminator Items  Post\",\n-                                        }\n+                                        \"schema\": IsOneOf(\n+                                            # Pydantic < 2.11: no additionalProperties\n+                                            {\n+                                                \"type\": \"object\",\n+                                                \"title\": \"Response Save Union Body Discriminator Items  Post\",\n+                                            },\n+                                            # Pydantic >= 2.11: has additionalProperties\n+                                            {\n+                                                \"type\": \"object\",\n+                                                \"additionalProperties\": True,\n+                                                \"title\": \"Response Save Union Body Discriminator Items  Post\",\n+                                            },\n+                                        )\n                                     }\n                                 },\n                             },\n@@ -114,11 +123,21 @@ def save_union_body_discriminator(\n                 \"schemas\": {\n                     \"FirstItem\": {\n                         \"properties\": {\n-                            \"value\": {\n-                                \"type\": \"string\",\n-                                \"const\": \"first\",\n-                                \"title\": \"Value\",\n-                            },\n+                            \"value\": IsOneOf(\n+                                # Pydantic >= 2.10: const only\n+                                {\n+                                    \"type\": \"string\",\n+                                    \"const\": \"first\",\n+                                    \"title\": \"Value\",\n+                                },\n+                                # Pydantic 2.9: const + enum\n+                                {\n+                                    \"type\": \"string\",\n+                                    \"const\": \"first\",\n+                                    \"enum\": [\"first\"],\n+                                    \"title\": \"Value\",\n+                                },\n+                            ),\n                             \"price\": {\"type\": \"integer\", \"title\": \"Price\"},\n                         },\n                         \"type\": \"object\",\n@@ -140,11 +159,21 @@ def save_union_body_discriminator(\n                     },\n                     \"OtherItem\": {\n                         \"properties\": {\n-                            \"value\": {\n-                                \"type\": \"string\",\n-                                \"const\": \"other\",\n-                                \"title\": \"Value\",\n-                            },\n+                            \"value\": IsOneOf(\n+                                # Pydantic >= 2.10.0: const only\n+                                {\n+                                    \"type\": \"string\",\n+                                    \"const\": \"other\",\n+                                    \"title\": \"Value\",\n+                                },\n+                                # Pydantic 2.9.x: const + enum\n+                                {\n+                                    \"type\": \"string\",\n+                                    \"const\": \"other\",\n+                                    \"enum\": [\"other\"],\n+                                    \"title\": \"Value\",\n+                                },\n+                            ),\n                             \"price\": {\"type\": \"number\", \"title\": \"Price\"},\n                         },\n                         \"type\": \"object\",\ndiff --git a/uv.lock b/uv.lock\nindex 096b0a361c057..90e9b4e4629cc 100644\n--- a/uv.lock\n+++ b/uv.lock\n@@ -1252,7 +1252,7 @@ requires-dist = [\n     { name = \"jinja2\", marker = \"extra == 'all'\", specifier = \">=3.1.5\" },\n     { name = \"jinja2\", marker = \"extra == 'standard'\", specifier = \">=3.1.5\" },\n     { name = \"jinja2\", marker = \"extra == 'standard-no-fastapi-cloud-cli'\", specifier = \">=3.1.5\" },\n-    { name = \"pydantic\", specifier = \">=2.7.0\" },\n+    { name = \"pydantic\", specifier = \">=2.9.0\" },\n     { name = \"pydantic-extra-types\", marker = \"extra == 'all'\", specifier = \">=2.0.0\" },\n     { name = \"pydantic-extra-types\", marker = \"extra == 'standard'\", specifier = \">=2.0.0\" },\n     { name = \"pydantic-extra-types\", marker = \"extra == 'standard-no-fastapi-cloud-cli'\", specifier = \">=2.0.0\" },\n@@ -1350,7 +1350,7 @@ docs-tests = [\n ]\n github-actions = [\n     { name = \"httpx\", specifier = \">=0.27.0,<1.0.0\" },\n-    { name = \"pydantic\", specifier = \">=2.5.3,<3.0.0\" },\n+    { name = \"pydantic\", specifier = \">=2.9.0,<3.0.0\" },\n     { name = \"pydantic-settings\", specifier = \">=2.1.0,<3.0.0\" },\n     { name = \"pygithub\", specifier = \">=2.3.0,<3.0.0\" },\n     { name = \"pyyaml\", specifier = \">=5.3.1,<7.0.0\" },\n",
+    "human_comments": [
+      {
+        "body": "```suggestion\n                    # Pydantic >= 2.11: no top-level OtherRole\n```",
+        "path": "tests/test_schema_compat_pydantic_v2.py",
+        "line": null
+      },
+      {
+        "body": "```suggestion\n                    # Pydantic < 2.11: adds a top-level OtherRole schema\n```",
+        "path": "tests/test_schema_compat_pydantic_v2.py",
+        "line": null
+      },
+      {
+        "body": "Not ideal that we duplicate min version number here, but I don't know if we can do better.\nAnd, this should cause any problems. So, I think it's fine",
+        "path": ".github/workflows/test.yml",
+        "line": 107
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": true,
+    "bug_description": "pydantic version fix + test suite",
+    "has_code_diff": true,
+    "lines_added": 100
+  },
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 14993,
+    "title": "\ud83d\udcdd Fix StreamingResponse async generator example to actually stream",
+    "body": "## Summary\n\nFixes #14680.\n\nThe `StreamingResponse` documentation example uses an async generator (`fake_video_streamer`) without any `await` expression. This causes two problems:\n\n1. **No true streaming** \u2014 without an `await` point, the async generator holds the event loop for the entire iteration, so the response is buffered entirely and sent all at once instead of being streamed chunk by chunk.\n2. **No proper cancellation** \u2014 in asyncio, a task can only be cancelled when it reaches an `await`. Without one, the generator cannot be interrupted and may keep running after cancellation is requested.\n\n## Changes\n\n### 1. Code example (`docs_src/custom_response/tutorial007_py310.py`)\n\nAdded `import asyncio` and `await asyncio.sleep(0)` inside the async generator loop. This is the minimal fix to yield control back to the event loop between iterations.\n\n### 2. Documentation (`docs/en/docs/advanced/custom-response.md`)\n\n- Updated highlighted line numbers to reflect the new `asyncio` import and `await` line.\n- Added a `/// note` admonition after the code example explaining why the `await` is necessary (event loop yielding, streaming, cancellation) and suggesting sync generators as an alternative.\n\nOnly the **English** docs are updated \u2014 translations are handled separately per project convention.\n\n## Validation\n\n- Existing test (`tests/test_tutorial/test_custom_response/test_tutorial007.py`) passes.\n- `ruff check` and `ruff format` pass cleanly.\n- Verified with a live uvicorn server that chunks now arrive incrementally (10 distinct chunks over ~377ms) instead of all at once.\n",
+    "merged": false,
+    "diff": "diff --git a/docs/en/docs/advanced/custom-response.md b/docs/en/docs/advanced/custom-response.md\nindex e88e958657842..b7131aa0b346a 100644\n--- a/docs/en/docs/advanced/custom-response.md\n+++ b/docs/en/docs/advanced/custom-response.md\n@@ -167,7 +167,19 @@ You can also use the `status_code` parameter combined with the `response_class`\n \n Takes an async generator or a normal generator/iterator and streams the response body.\n \n-{* ../../docs_src/custom_response/tutorial007_py310.py hl[2,14] *}\n+{* ../../docs_src/custom_response/tutorial007_py310.py hl[1,4,11,17] *}\n+\n+/// note\n+\n+Notice the `await asyncio.sleep(0)` inside the async generator function.\n+\n+In asyncio, a running task only yields control back to the event loop when it hits an `await`. Without any `await` expression, the generator would hold the event loop for the entire iteration, preventing the response from being streamed chunk by chunk and also preventing proper task cancellation.\n+\n+Adding `await asyncio.sleep(0)` is a lightweight way to give the event loop a chance to send each chunk to the client and handle cancellation between iterations.\n+\n+If your generator doesn't have any natural `await` points, consider using a **normal (synchronous) generator** with `def` instead to avoid this issue.\n+\n+///\n \n #### Using `StreamingResponse` with file-like objects { #using-streamingresponse-with-file-like-objects }\n \ndiff --git a/docs_src/custom_response/tutorial007_py310.py b/docs_src/custom_response/tutorial007_py310.py\nindex e2a53a21197fb..0c17ce40ee365 100644\n--- a/docs_src/custom_response/tutorial007_py310.py\n+++ b/docs_src/custom_response/tutorial007_py310.py\n@@ -1,3 +1,5 @@\n+import asyncio\n+\n from fastapi import FastAPI\n from fastapi.responses import StreamingResponse\n \n@@ -6,6 +8,7 @@\n \n async def fake_video_streamer():\n     for i in range(10):\n+        await asyncio.sleep(0)\n         yield b\"some fake video bytes\"\n \n \n",
+    "human_comments": [
+      {
+        "body": "The loop variable `i` is unused; consider renaming it to `_` to avoid implying the value is used and to keep the example focused.\n```suggestion\n    for _ in range(10):\n```",
+        "path": "docs_src/custom_response/tutorial007_py310.py",
+        "line": 10
+      },
+      {
+        "body": "The tip text is quite absolute (e.g. \"Without an `await`, the generator will run synchronously and the response will be buffered entirely\"). Even without an `await` inside the async generator, each `yield` still suspends execution; the real issue is typically blocking/CPU-bound work between yields or producing all chunks back-to-back so the transport coalesces them. Consider rephrasing to clarify that an `await` (or other pause/offloading) is needed to avoid blocking the event loop / to observe incremental delivery, rather than stating that async generators inherently buffer without `await`.\n```suggestion\nWhen using an **async generator**, make sure it includes at least one `await` (or other non-blocking pause/offloading) between iterations, for example `await asyncio.sleep(0)` or `await some_async_io()`. This yields control back to the event loop so it can send each chunk as it is produced, instead of running all the work in a tight loop where the client only sees the response once most of the work has completed.\n\nIf your async generator wraps mostly synchronous or CPU-bound work and has no natural `await` points, it may still behave as if the response is buffered because the event loop cannot interleave other tasks. In that case, consider using a **normal generator** with a `def` function and/or offloading the blocking work appropriately, while yielding smaller chunks.\n```",
+        "path": "docs/en/docs/advanced/custom-response.md",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 16
+  },
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 14934,
+    "title": "\u270f\ufe0f Fix several typos in ru translations",
+    "body": "Fix ru typos in docs",
+    "merged": true,
+    "diff": "diff --git a/docs/ru/docs/advanced/middleware.md b/docs/ru/docs/advanced/middleware.md\nindex 034feae7ebab6..1f1a160604c10 100644\n--- a/docs/ru/docs/advanced/middleware.md\n+++ b/docs/ru/docs/advanced/middleware.md\n@@ -83,7 +83,7 @@ app.add_middleware(UnicornMiddleware, some_config=\"rainbow\")\n \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u044e\u0442\u0441\u044f \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0435 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u044b:\n \n - `minimum_size` \u2014 \u043d\u0435 \u0441\u0436\u0438\u043c\u0430\u0442\u044c GZip\u2011\u043e\u043c \u043e\u0442\u0432\u0435\u0442\u044b, \u0440\u0430\u0437\u043c\u0435\u0440 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u043c\u0435\u043d\u044c\u0448\u0435 \u044d\u0442\u043e\u0433\u043e \u043c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u043e\u0433\u043e \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f \u0432 \u0431\u0430\u0439\u0442\u0430\u0445. \u041f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u2014 `500`.\n-- `compresslevel` \u2014 \u0443\u0440\u043e\u0432\u0435\u043d\u044c GZip\u2011\u0441\u0436\u0430\u0442\u0438\u044f. \u0426\u0435\u043b\u043e\u0435 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e 9. \u041f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u2014 `9`. \u0411\u043e\u043b\u0435\u0435 \u043d\u0438\u0437\u043a\u043e\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u2014 \u0431\u044b\u0441\u0442\u0440\u0435\u0435\u0435 \u0441\u0436\u0430\u0442\u0438\u0435, \u043d\u043e \u0431\u043e\u043b\u044c\u0448\u0438\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0444\u0430\u0439\u043b\u0430; \u0431\u043e\u043b\u0435\u0435 \u0432\u044b\u0441\u043e\u043a\u043e\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u2014 \u0431\u043e\u043b\u0435\u0435 \u043c\u0435\u0434\u043b\u0435\u043d\u043d\u043e\u0435 \u0441\u0436\u0430\u0442\u0438\u0435, \u043d\u043e \u043c\u0435\u043d\u044c\u0448\u0438\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0444\u0430\u0439\u043b\u0430.\n+- `compresslevel` \u2014 \u0443\u0440\u043e\u0432\u0435\u043d\u044c GZip\u2011\u0441\u0436\u0430\u0442\u0438\u044f. \u0426\u0435\u043b\u043e\u0435 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e 9. \u041f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u2014 `9`. \u0411\u043e\u043b\u0435\u0435 \u043d\u0438\u0437\u043a\u043e\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u2014 \u0431\u044b\u0441\u0442\u0440\u0435\u0435 \u0441\u0436\u0430\u0442\u0438\u0435, \u043d\u043e \u0431\u043e\u043b\u044c\u0448\u0438\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0444\u0430\u0439\u043b\u0430; \u0431\u043e\u043b\u0435\u0435 \u0432\u044b\u0441\u043e\u043a\u043e\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u2014 \u0431\u043e\u043b\u0435\u0435 \u043c\u0435\u0434\u043b\u0435\u043d\u043d\u043e\u0435 \u0441\u0436\u0430\u0442\u0438\u0435, \u043d\u043e \u043c\u0435\u043d\u044c\u0448\u0438\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0444\u0430\u0439\u043b\u0430.\n \n ## \u0414\u0440\u0443\u0433\u0438\u0435 middleware { #other-middlewares }\n \ndiff --git a/docs/ru/docs/deployment/docker.md b/docs/ru/docs/deployment/docker.md\nindex 791057fe56f66..5dfa2115991df 100644\n--- a/docs/ru/docs/deployment/docker.md\n+++ b/docs/ru/docs/deployment/docker.md\n@@ -214,7 +214,7 @@ CMD [\"fastapi\", \"run\", \"app/main.py\", \"--port\", \"80\"]\n \n 5. \u041a\u043e\u043f\u0438\u0440\u0443\u0435\u043c \u0434\u0438\u0440\u0435\u043a\u0442\u043e\u0440\u0438\u044e `./app` \u0432\u043d\u0443\u0442\u0440\u044c \u0434\u0438\u0440\u0435\u043a\u0442\u043e\u0440\u0438\u0438 `/code`.\n \n-    \u0422\u0430\u043a \u043a\u0430\u043a \u0437\u0434\u0435\u0441\u044c \u0432\u0435\u0441\u044c \u043a\u043e\u0434, \u043a\u043e\u0442\u043e\u0440\u044b\u0439 **\u043c\u0435\u043d\u044f\u0435\u0442\u0441\u044f \u0447\u0430\u0449\u0435 \u0432\u0441\u0435\u0433\u043e**, \u043a\u044d\u0448 Docker **\u0432\u0440\u044f\u0434 \u043b\u0438** \u0431\u0443\u0434\u0435\u0442 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u044c\u0441\u044f \u0434\u043b\u044f \u044d\u0442\u043e\u0433\u043e \u0448\u0430\u0433a \u0438\u043b\u0438 **\u043f\u043e\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0445 \u0448\u0430\u0433\u043e\u0432**.\n+    \u0422\u0430\u043a \u043a\u0430\u043a \u0437\u0434\u0435\u0441\u044c \u0432\u0435\u0441\u044c \u043a\u043e\u0434, \u043a\u043e\u0442\u043e\u0440\u044b\u0439 **\u043c\u0435\u043d\u044f\u0435\u0442\u0441\u044f \u0447\u0430\u0449\u0435 \u0432\u0441\u0435\u0433\u043e**, \u043a\u044d\u0448 Docker **\u0432\u0440\u044f\u0434 \u043b\u0438** \u0431\u0443\u0434\u0435\u0442 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u044c\u0441\u044f \u0434\u043b\u044f \u044d\u0442\u043e\u0433\u043e \u0448\u0430\u0433\u0430 \u0438\u043b\u0438 **\u043f\u043e\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0445 \u0448\u0430\u0433\u043e\u0432**.\n \n     \u041f\u043e\u044d\u0442\u043e\u043c\u0443 \u0432\u0430\u0436\u043d\u043e \u0440\u0430\u0437\u043c\u0435\u0441\u0442\u0438\u0442\u044c \u044d\u0442\u043e\u0442 \u0448\u0430\u0433 **\u0431\u043b\u0438\u0436\u0435 \u043a \u043a\u043e\u043d\u0446\u0443** `Dockerfile`, \u0447\u0442\u043e\u0431\u044b \u043e\u043f\u0442\u0438\u043c\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0432\u0440\u0435\u043c\u044f \u0441\u0431\u043e\u0440\u043a\u0438 \u043e\u0431\u0440\u0430\u0437\u0430 \u043a\u043e\u043d\u0442\u0435\u0439\u043d\u0435\u0440\u0430.\n \ndiff --git a/docs/ru/docs/history-design-future.md b/docs/ru/docs/history-design-future.md\nindex e2395fe8b935b..50191576004ad 100644\n--- a/docs/ru/docs/history-design-future.md\n+++ b/docs/ru/docs/history-design-future.md\n@@ -76,4 +76,4 @@\n \n \u0423 **FastAPI** \u0432\u0435\u043b\u0438\u043a\u043e\u0435 \u0431\u0443\u0434\u0443\u0449\u0435\u0435.\n \n-\u0418 [\u0432\u0430\u0448 \u0432\u043a\u043b\u0430\u0434 \u0432 \u044d\u0442\u043e](help-fastapi.md){.internal-link target=_blank} - \u043e\u0447\u0435\u043d\u044c \u0446\u0435\u043d\u043d\u0435\u043d.\n+\u0418 [\u0432\u0430\u0448 \u0432\u043a\u043b\u0430\u0434 \u0432 \u044d\u0442\u043e](help-fastapi.md){.internal-link target=_blank} - \u043e\u0447\u0435\u043d\u044c \u0446\u0435\u043d\u0435\u043d.\ndiff --git a/docs/ru/docs/tutorial/security/oauth2-jwt.md b/docs/ru/docs/tutorial/security/oauth2-jwt.md\nindex 7838b07df4136..f7853d48f77dc 100644\n--- a/docs/ru/docs/tutorial/security/oauth2-jwt.md\n+++ b/docs/ru/docs/tutorial/security/oauth2-jwt.md\n@@ -20,7 +20,7 @@ eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4\n \n \u041d\u043e \u043e\u043d \u043f\u043e\u0434\u043f\u0438\u0441\u0430\u043d. \u0421\u043b\u0435\u0434\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u043d\u043e, \u043a\u043e\u0433\u0434\u0430 \u0432\u044b \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u0442\u0435 \u0442\u043e\u043a\u0435\u043d, \u043a\u043e\u0442\u043e\u0440\u044b\u0439 \u0432\u044b \u044d\u043c\u0438\u0442\u0438\u0440\u043e\u0432\u0430\u043b\u0438 (\u0432\u044b\u0434\u0430\u0432\u0430\u043b\u0438), \u0432\u044b \u043c\u043e\u0436\u0435\u0442\u0435 \u0443\u0431\u0435\u0434\u0438\u0442\u044c\u0441\u044f, \u0447\u0442\u043e \u044d\u0442\u043e \u0438\u043c\u0435\u043d\u043d\u043e \u0432\u044b \u0435\u0433\u043e \u044d\u043c\u0438\u0442\u0438\u0440\u043e\u0432\u0430\u043b\u0438.\n \n-\u0422\u0430\u043a\u0438\u043c \u043e\u0431\u0440\u0430\u0437\u043e\u043c, \u043c\u043e\u0436\u043d\u043e \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0442\u043e\u043a\u0435\u043d \u0441\u043e \u0441\u0440\u043e\u043a\u043e\u043c \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f, \u0441\u043a\u0430\u0436\u0435\u043c, 1 \u043d\u0435\u0434\u0435\u043b\u044f. \u0410 \u043a\u043e\u0433\u0434\u0430 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u0432\u0435\u0440\u043d\u0435\u0442\u0441\u044f \u043d\u0430 \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0434\u0435\u043d\u044c \u0441 \u0442\u0435\u043c \u0436\u0435 \u0442\u043e\u043a\u0435\u043d\u043e\u043c, \u0432\u044b \u0431\u0443\u0434\u0435\u0442\u0435 \u0437\u043d\u0430\u0442\u044c, \u0447\u0442\u043e \u043e\u043d \u0432\u0441\u0435 \u0435\u0449\u0435 \u0430\u0432\u0442\u043e\u0440\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0432\u0430\u0448\u0435\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u0435.\n+\u0422\u0430\u043a\u0438\u043c \u043e\u0431\u0440\u0430\u0437\u043e\u043c, \u043c\u043e\u0436\u043d\u043e \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0442\u043e\u043a\u0435\u043d \u0441\u043e \u0441\u0440\u043e\u043a\u043e\u043c \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f, \u0441\u043a\u0430\u0436\u0435\u043c, 1 \u043d\u0435\u0434\u0435\u043b\u044f. \u0410 \u043a\u043e\u0433\u0434\u0430 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u0432\u0435\u0440\u043d\u0435\u0442\u0441\u044f \u043d\u0430 \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0434\u0435\u043d\u044c \u0441 \u0442\u0435\u043c \u0436\u0435 \u0442\u043e\u043a\u0435\u043d\u043e\u043c, \u0432\u044b \u0431\u0443\u0434\u0435\u0442\u0435 \u0437\u043d\u0430\u0442\u044c, \u0447\u0442\u043e \u043e\u043d \u0432\u0441\u0435 \u0435\u0449\u0435 \u0430\u0432\u0442\u043e\u0440\u0438\u0437\u043e\u0432\u0430\u043d \u0432 \u0432\u0430\u0448\u0435\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u0435.\n \n \u0427\u0435\u0440\u0435\u0437 \u043d\u0435\u0434\u0435\u043b\u044e \u0441\u0440\u043e\u043a \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f \u0442\u043e\u043a\u0435\u043d\u0430 \u0438\u0441\u0442\u0435\u0447\u0435\u0442, \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c \u043d\u0435 \u0431\u0443\u0434\u0435\u0442 \u0430\u0432\u0442\u043e\u0440\u0438\u0437\u043e\u0432\u0430\u043d \u0438 \u0435\u043c\u0443 \u043f\u0440\u0438\u0434\u0435\u0442\u0441\u044f \u0437\u0430\u043d\u043e\u0432\u043e \u0432\u0445\u043e\u0434\u0438\u0442\u044c \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u0443, \u0447\u0442\u043e\u0431\u044b \u043f\u043e\u043b\u0443\u0447\u0438\u0442\u044c \u043d\u043e\u0432\u044b\u0439 \u0442\u043e\u043a\u0435\u043d. \u0410 \u0435\u0441\u043b\u0438 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c (\u0438\u043b\u0438 \u0442\u0440\u0435\u0442\u044c\u0435 \u043b\u0438\u0446\u043e) \u043f\u043e\u043f\u044b\u0442\u0430\u0435\u0442\u0441\u044f \u043c\u043e\u0434\u0438\u0444\u0438\u0446\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u043e\u043a\u0435\u043d, \u0447\u0442\u043e\u0431\u044b \u0438\u0437\u043c\u0435\u043d\u0438\u0442\u044c \u0441\u0440\u043e\u043a \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f, \u0432\u044b \u0441\u043c\u043e\u0436\u0435\u0442\u0435 \u044d\u0442\u043e \u043e\u0431\u043d\u0430\u0440\u0443\u0436\u0438\u0442\u044c, \u043f\u043e\u0441\u043a\u043e\u043b\u044c\u043a\u0443 \u043f\u043e\u0434\u043f\u0438\u0441\u0438 \u043d\u0435 \u0431\u0443\u0434\u0443\u0442 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0442\u044c.\n \n",
+    "human_comments": [
+      {
+        "body": "`\u043e\u0444\u043b\u0430\u0439\u043d\u0435` is correct: https://gramota.ru/spravka/vopros/290484",
+        "path": "docs/ru/docs/how-to/custom-docs-ui-assets.md",
+        "line": null
+      },
+      {
+        "body": "```suggestion\n\u0421\u0430\u043c\u043e\u0441\u0442\u043e\u044f\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u0445\u043e\u0441\u0442\u0438\u043d\u0433 JavaScript \u0438 CSS \u043c\u043e\u0436\u0435\u0442 \u0431\u044b\u0442\u044c \u043f\u043e\u043b\u0435\u0437\u0435\u043d, \u0435\u0441\u043b\u0438, \u043d\u0430\u043f\u0440\u0438\u043c\u0435\u0440, \u0432\u0430\u043c \u043d\u0443\u0436\u043d\u043e, \u0447\u0442\u043e\u0431\u044b \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0430\u043b\u043e \u0440\u0430\u0431\u043e\u0442\u0430\u0442\u044c \u0432 \u043e\u0444\u043b\u0430\u0439\u043d\u0435, \u0431\u0435\u0437 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u043a \u043e\u0442\u043a\u0440\u044b\u0442\u043e\u043c\u0443 \u0418\u043d\u0442\u0435\u0440\u043d\u0435\u0442\u0443, \u0438\u043b\u0438 \u0432 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u043e\u0439 \u0441\u0435\u0442\u0438.\n```",
+        "path": "docs/ru/docs/how-to/custom-docs-ui-assets.md",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 4
+  },
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 14927,
+    "title": "Fix UnboundLocalError in OpenAPI schema generation with custom respon\u2026",
+    "body": "When a route uses a custom response class whose __init__ does not expose a status_code parameter with an int default, and the route decorator does not specify an explicit status_code, the status_code local variable in get_openapi_path() was never assigned. This caused an UnboundLocalError at the point where status_code is used to populate the operation responses dict.\r\n\r\nThe bug does not surface with standard Starlette response classes (JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse, etc.) because they all declare status_code: int = 200 (or 307 for redirects) in their __init__ signatures. It triggers when users define custom response classes that wrap or omit the status_code parameter, e.g.:\r\n\r\n    class CustomResponse(Response):\r\n        def __init__(self, content, **kwargs):\r\n            super().__init__(content=content, status_code=200, **kwargs)\r\n\r\n    @app.get(\"/items\", response_class=CustomResponse)\r\n    async def get_items(): ...\r\n\r\nAccessing /openapi.json or /docs would crash with:\r\n    UnboundLocalError: cannot access local variable 'status_code'\r\n\r\nFix: initialize status_code = \"200\" before the conditional block so it always has a safe default. The existing branches that extract status_code from the route or from the response class signature still override this default when applicable.",
+    "merged": false,
+    "diff": "diff --git a/fastapi/openapi/utils.py b/fastapi/openapi/utils.py\nindex 812003aee315a..910eca72f1a7c 100644\n--- a/fastapi/openapi/utils.py\n+++ b/fastapi/openapi/utils.py\n@@ -339,6 +339,7 @@ def get_openapi_path(\n                         )\n                         callbacks[callback.name] = {callback.path: cb_path}\n                 operation[\"callbacks\"] = callbacks\n+            status_code = \"200\"\n             if route.status_code is not None:\n                 status_code = str(route.status_code)\n             else:\ndiff --git a/tests/test_openapi_custom_response_class_no_status_code.py b/tests/test_openapi_custom_response_class_no_status_code.py\nnew file mode 100644\nindex 0000000000000..7ec1d7115ee62\n--- /dev/null\n+++ b/tests/test_openapi_custom_response_class_no_status_code.py\n@@ -0,0 +1,62 @@\n+from fastapi import FastAPI\n+from fastapi.testclient import TestClient\n+from inline_snapshot import snapshot\n+from starlette.responses import Response\n+\n+\n+class CustomResponse(Response):\n+    \"\"\"A custom response class whose __init__ does not expose status_code\n+    as a parameter with an int default. This previously caused an\n+    UnboundLocalError during OpenAPI schema generation when the route\n+    did not specify an explicit status_code.\"\"\"\n+\n+    media_type = \"text/plain\"\n+\n+    def __init__(self, content: str, **kwargs: object) -> None:\n+        super().__init__(content=content, status_code=200, **kwargs)\n+\n+\n+app = FastAPI()\n+\n+\n+@app.get(\"/items\", response_class=CustomResponse)\n+async def get_items():\n+    return \"ok\"\n+\n+\n+client = TestClient(app)\n+\n+\n+def test_get_response():\n+    response = client.get(\"/items\")\n+    assert response.status_code == 200\n+    assert response.text == \"ok\"\n+\n+\n+def test_openapi_schema():\n+    \"\"\"OpenAPI generation must not crash when the response class's __init__\n+    lacks a status_code parameter with an int default.\"\"\"\n+    response = client.get(\"/openapi.json\")\n+    assert response.status_code == 200, response.text\n+    assert response.json() == snapshot(\n+        {\n+            \"openapi\": \"3.1.0\",\n+            \"info\": {\"title\": \"FastAPI\", \"version\": \"0.1.0\"},\n+            \"paths\": {\n+                \"/items\": {\n+                    \"get\": {\n+                        \"summary\": \"Get Items\",\n+                        \"operationId\": \"get_items_items_get\",\n+                        \"responses\": {\n+                            \"200\": {\n+                                \"description\": \"Successful Response\",\n+                                \"content\": {\n+                                    \"text/plain\": {\"schema\": {\"type\": \"string\"}}\n+                                },\n+                            }\n+                        },\n+                    }\n+                }\n+            },\n+        }\n+    )\n",
+    "human_comments": [
+      {
+        "body": "I think this is incorrect to assume the status code is 200.\n\nThe approach described in the comment seems to be better:\n\n>                 # It would probably make more sense for all response classes to have an\n>                 # explicit default status_code, and to extract it from them, instead of\n>                 # doing this inspection tricks, that would probably be in the future\n>                 # TODO: probably make status_code a default class attribute for all\n>                 # responses in Starlette",
+        "path": "fastapi/openapi/utils.py",
+        "line": 342
+      },
+      {
+        "body": "I agree with @YuriiMotov. \r\nstatus_code = \"200\" is to avoid an UnboundLocalError if no status code is defined.\r\nHowever, an explicit \"200\" can be misleading to API consumers; using the OpenAPI \"default\" response as a fallback would be safer and more informative.\r\n\r\nstatus_code = \"default\"\r\n\r\n\"responses\": {\r\n  \"200\": { \"description\": \"Success\" },\r\n  \"400\": { \"description\": \"Bad request\" },\r\n  \"default\": { \"description\": \"Unexpected error\" }\r\n}",
+        "path": "fastapi/openapi/utils.py",
+        "line": 342
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": true,
+    "bug_description": "UnboundLocalError in OpenAPI schema generation",
+    "has_code_diff": true,
+    "lines_added": 63
+  },
+  {
+    "repo": "tiangolo/fastapi",
+    "pr_number": 14867,
+    "title": "\ud83d\udd27 Enable FURB ruff rule",
+    "body": "Add https://docs.astral.sh/ruff/rules/#refurb-furb ruff rule and fix in code",
+    "merged": false,
+    "diff": "diff --git a/fastapi/routing.py b/fastapi/routing.py\nindex ea82ab14a3529..36774e0c5ce8a 100644\n--- a/fastapi/routing.py\n+++ b/fastapi/routing.py\n@@ -436,9 +436,7 @@ async def app(request: Request) -> Response:\n                 }\n                 # If status_code was set, use it, otherwise use the default from the\n                 # response class, in the case of redirect it's 307\n-                current_status_code = (\n-                    status_code if status_code else solved_result.response.status_code\n-                )\n+                current_status_code = status_code or solved_result.response.status_code\n                 if current_status_code is not None:\n                     response_args[\"status_code\"] = current_status_code\n                 if solved_result.response.status_code:\ndiff --git a/pyproject.toml b/pyproject.toml\nindex 1e6fda3b1c57a..9823e5abffbe0 100644\n--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -502,6 +502,7 @@ select = [\n     \"B\",  # flake8-bugbear\n     \"C4\",  # flake8-comprehensions\n     \"UP\",  # pyupgrade\n+    \"FURB\"  # refurb\n ]\n ignore = [\n     \"E501\",  # line too long, handled by black\ndiff --git a/scripts/doc_parsing_utils.py b/scripts/doc_parsing_utils.py\nindex 79f2e9ec0a558..fea95669bc566 100644\n--- a/scripts/doc_parsing_utils.py\n+++ b/scripts/doc_parsing_utils.py\n@@ -1,5 +1,5 @@\n import re\n-from typing import TypedDict, Union\n+from typing import TypedDict\n \n CODE_INCLUDE_RE = re.compile(r\"^\\{\\*\\s*(\\S+)\\s*(.*)\\*\\}$\")\n CODE_INCLUDE_PLACEHOLDER = \"<CODE_INCLUDE>\"\n@@ -50,8 +50,8 @@ class MarkdownLinkInfo(TypedDict):\n     line_no: int\n     url: str\n     text: str\n-    title: Union[str, None]\n-    attributes: Union[str, None]\n+    title: str | None\n+    attributes: str | None\n     full_match: str\n \n \n@@ -287,8 +287,8 @@ def _add_lang_code_to_url(url: str, lang_code: str) -> str:\n def _construct_markdown_link(\n     url: str,\n     text: str,\n-    title: Union[str, None],\n-    attributes: Union[str, None],\n+    title: str | None,\n+    attributes: str | None,\n     lang_code: str,\n ) -> str:\n     \"\"\"\n@@ -549,7 +549,7 @@ def extract_multiline_code_blocks(text: list[str]) -> list[MultilineCodeBlockInf\n     return blocks\n \n \n-def _split_hash_comment(line: str) -> tuple[str, Union[str, None]]:\n+def _split_hash_comment(line: str) -> tuple[str, str | None]:\n     match = HASH_COMMENT_RE.match(line)\n     if match:\n         code = match.group(\"code\").rstrip()\n@@ -558,7 +558,7 @@ def _split_hash_comment(line: str) -> tuple[str, Union[str, None]]:\n     return line.rstrip(), None\n \n \n-def _split_slashes_comment(line: str) -> tuple[str, Union[str, None]]:\n+def _split_slashes_comment(line: str) -> tuple[str, str | None]:\n     match = SLASHES_COMMENT_RE.match(line)\n     if match:\n         code = match.group(\"code\").rstrip()\n@@ -594,7 +594,7 @@ def replace_multiline_code_block(\n         )\n \n     block_language = block_a[\"lang\"].lower()\n-    if block_language in {\"mermaid\"}:\n+    if block_language == \"mermaid\":\n         if block_a != block_b:\n             print(\n                 f\"Skipping mermaid code block replacement (lines {start_line}-{end_line_no}). \"\n@@ -604,8 +604,8 @@ def replace_multiline_code_block(\n \n     code_block: list[str] = []\n     for line_a, line_b in zip(block_a[\"content\"], block_b[\"content\"]):\n-        line_a_comment: Union[str, None] = None\n-        line_b_comment: Union[str, None] = None\n+        line_a_comment: str | None = None\n+        line_b_comment: str | None = None\n \n         # Handle comments based on language\n         if block_language in {\n",
+    "human_comments": [
+      {
+        "body": "```suggestion\n    \"E\",  # pycodestyle errors\n    \"W\",  # pycodestyle warnings\n    \"F\",  # pyflakes\n    \"I\",  # isort\n    \"B\",  # flake8-bugbear\n    \"C4\",  # flake8-comprehensions\n    \"UP\",  # pyupgrade\n    \"FURB\"  # refurb\n```\n\nAvoid unnecessary changes in order to minimize the diff\n",
+        "path": "pyproject.toml",
+        "line": null
+      },
+      {
+        "body": "If this is not necessary for this rule to work, it should be done in a separate PR (dependabot will take care of it)\n```suggestion\n    \"ruff >=0.14.14\",\n```",
+        "path": "pyproject.toml",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 12
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5888,
+    "title": "Docs: add context to Incoming Request Data section",
+    "body": ":wq\r\n\r\n<!--\r\nBefore opening a PR, open a ticket describing the issue or feature the\r\nPR will address. An issue is not required for fixing typos in\r\ndocumentation, or other simple non-code changes.\r\n\r\nReplace this comment with a description of the change. Describe how it\r\naddresses the linked ticket.\r\n-->\r\n\r\n<!--\r\nLink to relevant issues or previous PRs, one per line. Use \"fixes\" to\r\nautomatically close an issue.\r\n\r\nfixes #<issue number>\r\n-->\r\n\r\n<!--\r\nEnsure each step in CONTRIBUTING.rst is complete, especially the following:\r\n\r\n- Add tests that demonstrate the correct behavior of the change. Tests\r\n  should fail without the change.\r\n- Add or update relevant docs, in the docs folder and in code.\r\n- Add an entry in CHANGES.rst summarizing the change and linking to the issue.\r\n- Add `.. versionchanged::` entries in any relevant code docs.\r\n-->\r\n",
+    "merged": false,
+    "diff": "diff --git a/docs/api.rst b/docs/api.rst\nindex d3c517f1b4..f130058fef 100644\n--- a/docs/api.rst\n+++ b/docs/api.rst\n@@ -26,6 +26,9 @@ Blueprint Objects\n Incoming Request Data\n ---------------------\n \n+This section describes how to access data sent by the client in an HTTP\n+request, such as query parameters, form data, JSON payloads, and headers.\n+\n .. autoclass:: Request\n     :members:\n     :inherited-members:\n@@ -34,7 +37,8 @@ Incoming Request Data\n .. data:: request\n \n     A proxy to the request data for the current request, an instance of\n-    :class:`.Request`.\n+    :class:`.Request`. This is the primary interface used by view functions\n+    to access incoming request information.\n \n     This is only available when a :doc:`request context </appcontext>` is\n     active.\n",
+    "human_comments": [
+      {
+        "body": "Consider adding consistency with other sections. The 'Sessions' section (lines 59-67) and 'Application Globals' section (lines 151-156) also have introductory paragraphs. However, 'Application Object', 'Blueprint Objects', and 'Response Objects' sections do not. While this addition is helpful, it creates inconsistency. Consider either adding similar introductions to other major sections or ensuring the current style aligns with the documentation's overall approach.",
+        "path": "docs/api.rst",
+        "line": 30
+      },
+      {
+        "body": "Thanks for pointing this out \u2014 that\u2019s a fair observation.\n\nMy intention was to add a small amount of context in a section that currently\njumps straight into the API reference, similar to how the Sessions and\nApplication Globals sections provide brief introductions.\n\nSince this is my first contribution, I tried to keep the scope limited to a\nsingle section to avoid larger stylistic changes. That said, I\u2019m happy to\neither adjust the wording to better match the existing approach, or add similar\nintroductory context to other major sections (such as Application Object,\nBlueprint Objects, and Response Objects) if that would be preferred.\n\nPlease let me know which direction you\u2019d recommend.",
+        "path": "docs/api.rst",
+        "line": 30
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 5
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5775,
+    "title": "Fix: Raise RuntimeError when stream_with_context is used on async view",
+    "body": "This PR adds a test that verifies `stream_with_context` raises a `RuntimeError` when applied to an async route, which is currently unsupported in Flask.\r\n\r\n- Added test: `test_stream_with_context_fails_with_async_route`\r\n- Asserts the correct error message: `\"Install Flask with the 'async' extra\"`\r\n- Handles coroutine cleanup properly with `gc.collect()`\r\n\r\nCloses #5774\r\n",
+    "merged": false,
+    "diff": "diff --git a/tests/test_helpers.py b/tests/test_helpers.py\nindex ee77f1760c..a466a0f9b9 100644\n--- a/tests/test_helpers.py\n+++ b/tests/test_helpers.py\n@@ -234,18 +234,32 @@ def test_name_with_import_error(self, modules_tmp_path):\n \n \n class TestStreaming:\n-    def test_streaming_with_context(self, app, client):\n-        @app.route(\"/\")\n-        def index():\n+    def test_stream_with_context_fails_with_async_route(self):\n+        import gc\n+\n+        import pytest\n+\n+        import flask\n+\n+        app = flask.Flask(__name__)\n+\n+        @app.route(\"/stream\")\n+        async def stream():\n+            @flask.stream_with_context\n             def generate():\n-                yield \"Hello \"\n-                yield flask.request.args[\"name\"]\n-                yield \"!\"\n+                yield \"hello\"\n \n-            return flask.Response(flask.stream_with_context(generate()))\n+            return flask.Response(generate())\n \n-        rv = client.get(\"/?name=World\")\n-        assert rv.data == b\"Hello World!\"\n+        with app.test_request_context(\"/stream\"):\n+            with pytest.raises(\n+                RuntimeError, match=\"Install Flask with the 'async' extra\"\n+            ):\n+                # This forces Flask to run the async view and raise the RuntimeError\n+                app.ensure_sync(app.view_functions[\"stream\"])()\n+\n+        # Clean up coroutine warnings\n+        gc.collect()\n \n     def test_streaming_with_context_as_decorator(self, app, client):\n         @app.route(\"/\")\n",
+    "human_comments": [
+      {
+        "body": "Why did you replace this test? It's still relevant as well.",
+        "path": "tests/test_helpers.py",
+        "line": 237
+      },
+      {
+        "body": "These imports should not be local to this function, and should not have spaces in between each one.",
+        "path": "tests/test_helpers.py",
+        "line": 238
+      },
+      {
+        "body": "Why did you not use the `app` fixture like the test you (incorrectly) replaced?",
+        "path": "tests/test_helpers.py",
+        "line": 244
+      },
+      {
+        "body": "Why are you using `with test_request_context` rather than making a request with the client like the previous test?",
+        "path": "tests/test_helpers.py",
+        "line": 254
+      },
+      {
+        "body": "This is not testing the issue you linked to. This only raises when the async extra is not installed, and that's already tested elsewhere. This also fails when the async extra _is_ installed.",
+        "path": "tests/test_helpers.py",
+        "line": 259
+      },
+      {
+        "body": "This is not how to clean up coroutines. If you made a request with the test client, you wouldn't have run into this either.",
+        "path": "tests/test_helpers.py",
+        "line": 262
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": true,
+    "bug_description": "RuntimeError when stream_with_context on async",
+    "has_code_diff": true,
+    "lines_added": 23
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5722,
+    "title": "docs: add warning and best practices for url_for(..., _external=True)\u2026",
+    "body": "###  **Description of the Change**\r\nThis pull request adds a warning and best practices to the Web Security documentation regarding the use of url_for(..., _external=True) without setting SERVER_NAME or trusted_hosts. The new section explains the risk of host header injection and provides recommendations for safer configuration. This aims to improve developer awareness and help prevent potential security vulnerabilities, as discussed in #5718.\r\n\r\n### **How it Addresses the Issue**\r\n-  Documents the risk of host header injection when generating external URLs.\r\n- Recommends setting SERVER_NAME and using trusted_hosts.\r\n- References the ProxyFix documentation for further guidance.\r\n\r\n**Relevant Issue**\r\nfixes #5718",
+    "merged": false,
+    "diff": "diff --git a/docs/web-security.rst b/docs/web-security.rst\nindex d742056fea..98ebe25320 100644\n--- a/docs/web-security.rst\n+++ b/docs/web-security.rst\n@@ -9,6 +9,30 @@ will depend on each application's specific needs and threat model. Many hosting\n platforms may take care of certain types of problems without the need for the\n Flask application to handle them.\n \n+Host Header Injection and External URLs\n+---------------------------------------\n+\n+When generating external URLs using :func:`url_for` with the ``_external=True`` argument,\n+Flask constructs the URL using the requeust's ``Host`` header by default. If your application\n+does not explicitly set the :data:`SERVER_NAME` configuration or use :data:`trusted_hosts`,\n+this can make your app vulnerable to host header injection attacks. This is especially\n+critical when generating links for password resets or other sensitive actions that may be\n+sent to users.\n+\n+.. warning::\n+\n+    **Host Header Injection Risk:** If an attacker can control the ``Host`` header in a request,\n+    they may be able to generate links pointing to malicious domains. This is a risk when\n+    using ``url_for(..., _external=True)`` without proper configuration.\n+\n+**Best Practices:**\n+\n+- Always set :data:`SERVER_NAME` in your configuration for production deployments.\n+- Consider using :data:`trusted_hosts` to restrict which hosts are accepted.\n+- Review the :doc:`/deploying/proxy_fix` documentation for more details on handling proxies and headers securely.\n+\n+For more information, see :issue:`5718`.\n+\n Resource Use\n ------------\n \n",
+    "human_comments": [
+      {
+        "body": "It always uses the `Host` header, not only by default. That's why the config needs to be set.",
+        "path": "docs/web-security.rst",
+        "line": 16
+      },
+      {
+        "body": "The `Request.trusted_hosts` attribute on the individual request is not the correct place to start. Instead, use the global `TRUSTED_HOSTS` config. The attribute is used to modify that per-request.",
+        "path": "docs/web-security.rst",
+        "line": 31
+      },
+      {
+        "body": "Don't \"consider\" using it, *do* use it, it's the only thing that actually protects from the issue.",
+        "path": "docs/web-security.rst",
+        "line": 31
+      },
+      {
+        "body": "This is the same statement as the previous paragraph, just restated in a warning block and bold now.",
+        "path": "docs/web-security.rst",
+        "line": 22
+      },
+      {
+        "body": "`SERVER_NAME` is only used outside of requests, where the injection isn't relevant because there's not request or `Host` header anyway.",
+        "path": "docs/web-security.rst",
+        "line": 30
+      },
+      {
+        "body": "Both of these are wrong, see further on.",
+        "path": "docs/web-security.rst",
+        "line": 17
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 24
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5555,
+    "title": "Refactor helpers.py to Move Hard-Coded List to globals.py",
+    "body": "This pull request refactors the **` helpers.py `** file by moving a hard-coded list of false attributes to the **` globals.py `** file. The list, previously hard-coded in multiple locations, is now centralized in **` globals.py `** as a new global constant named **`_false_attributes`**.\r\n\r\n#### Changes Made:\r\n\r\n- Added _false_attributes list to globals.py with the value [\"0\", \"false\", \"no\", \"null\", \"none\"].\r\n- Updated helpers.py to use the new _false_attributes variable from globals.py.\r\n \r\n#### Benefits:\r\n\r\n- Improved Maintainability: Centralizing the list makes future updates easier and reduces duplication.\r\n- Enhanced Readability: Using a named constant improves code clarity and intention.\r\n\r\n#### Testing:\r\n\r\n- Verified that the changes do not introduce any regressions or break existing functionality.\r\n- Please review the changes and let me know if any additional modifications are needed. Thank you!",
+    "merged": false,
+    "diff": "diff --git a/src/flask/globals.py b/src/flask/globals.py\nindex e2c410cc5b..56244679a5 100644\n--- a/src/flask/globals.py\n+++ b/src/flask/globals.py\n@@ -49,3 +49,5 @@\n session: SessionMixin = LocalProxy(  # type: ignore[assignment]\n     _cv_request, \"session\", unbound_message=_no_req_msg\n )\n+\n+_false_attributes: list[str] = [\"0\", \"false\", \"no\", \"null\", \"none\"]\ndiff --git a/src/flask/helpers.py b/src/flask/helpers.py\nindex 00abe046b1..d34643a2a8 100644\n--- a/src/flask/helpers.py\n+++ b/src/flask/helpers.py\n@@ -14,6 +14,7 @@\n from werkzeug.wrappers import Response as BaseResponse\n \n from .globals import _cv_request\n+from .globals import _false_attributes\n from .globals import current_app\n from .globals import request\n from .globals import request_ctx\n@@ -29,7 +30,7 @@ def get_debug_flag() -> bool:\n     :envvar:`FLASK_DEBUG` environment variable. The default is ``False``.\n     \"\"\"\n     val = os.environ.get(\"FLASK_DEBUG\")\n-    return bool(val and val.lower() not in {\"0\", \"false\", \"no\"})\n+    return bool(val and val.lower() not in _false_attributes)\n \n \n def get_load_dotenv(default: bool = True) -> bool:\n@@ -44,7 +45,7 @@ def get_load_dotenv(default: bool = True) -> bool:\n     if not val:\n         return default\n \n-    return val.lower() in (\"0\", \"false\", \"no\")\n+    return val.lower() in _false_attributes\n \n \n def stream_with_context(\n",
+    "human_comments": [
+      {
+        "body": "`null` and `none` do not make sense here, it's not something people would pass for a boolean option.\r\n\r\nAlso, this does not belong in this file. `helpers.py` is already he most suitable path.\r\n\r\nBut considering that it's already in two very simple utility functions, I'm not sure if it even makes much sense to extract this into a separate list (which, by the way, should be a set and not a list)",
+        "path": "src/flask/globals.py",
+        "line": null
+      },
+      {
+        "body": "This is a unmarked behavior change, this list is more exhaustive,\n\nThis might create trouble for slightly sarcastic deployments \n\n",
+        "path": "src/flask/globals.py",
+        "line": 53
+      },
+      {
+        "body": "it makes better practice. its not hard coded and better to maintaine.\r\nin addition, i aggree that none and null shouldnt be passed as boolean but you can use None as False in python (in a condition. \" if None\" is will evaluate to False.",
+        "path": "src/flask/globals.py",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 5
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5544,
+    "title": "Fixes Pyright type errors for `src/flask/app.py`",
+    "body": "Fixes Pyright type errors for `src/flask/app.py`.\r\n\r\nfixes #5543\r\n",
+    "merged": false,
+    "diff": "diff --git a/CHANGES.rst b/CHANGES.rst\nindex 985c8a0d72..7e8d734363 100644\n--- a/CHANGES.rst\n+++ b/CHANGES.rst\n@@ -6,6 +6,7 @@ Version 3.1.0\n -   ``Flask.open_resource``/``open_instance_resource`` and\n     ``Blueprint.open_resource`` take an ``encoding`` parameter to use when\n     opening in text mode. It defaults to ``utf-8``. :issue:`5504`\n+-   Fixes Pyright type errors in ``src/flask/app.py``. :issue:`5543`\n \n Version 3.0.3\n -------------\ndiff --git a/src/flask/app.py b/src/flask/app.py\nindex 53eb602c2a..c59e207c6a 100644\n--- a/src/flask/app.py\n+++ b/src/flask/app.py\n@@ -7,6 +7,7 @@\n import weakref\n from datetime import timedelta\n from inspect import iscoroutinefunction\n+from io import BufferedReader\n from itertools import chain\n from types import TracebackType\n from urllib.parse import quote as _url_quote\n@@ -322,7 +323,7 @@ def send_static_file(self, filename: str) -> Response:\n \n     def open_resource(\n         self, resource: str, mode: str = \"rb\", encoding: str | None = None\n-    ) -> t.IO[t.AnyStr]:\n+    ) -> t.IO[t.AnyStr] | BufferedReader:\n         \"\"\"Open a resource file relative to :attr:`root_path` for reading.\n \n         For example, if the file ``schema.sql`` is next to the file\n@@ -1167,17 +1168,20 @@ def make_response(self, rv: ft.ResponseReturnValue) -> Response:\n \n         # unpack tuple returns\n         if isinstance(rv, tuple):\n-            len_rv = len(rv)\n-\n             # a 3-tuple is unpacked directly\n-            if len_rv == 3:\n-                rv, status, headers = rv  # type: ignore[misc]\n+            if len(rv) == 3:\n+                rv, status, headers = rv\n             # decide if a 2-tuple has status or headers\n-            elif len_rv == 2:\n-                if isinstance(rv[1], (Headers, dict, tuple, list)):\n-                    rv, headers = rv\n+            elif len(rv) == 2:\n+                rv0 = rv[0]\n+                rv1 = rv[1]\n+                if isinstance(rv1, (Headers, dict, tuple, list)):\n+                    rv = rv0\n+                    headers = rv1\n                 else:\n-                    rv, status = rv  # type: ignore[assignment,misc]\n+                    rv = rv0\n+                    if isinstance(rv1, int):\n+                        status = rv1\n             # other sized tuples are not allowed\n             else:\n                 raise TypeError(\n",
+    "human_comments": [
+      {
+        "body": "I don't understand why this code was refactored. Can you address the issue with more minimal code changes?",
+        "path": "src/flask/app.py",
+        "line": 1172
+      },
+      {
+        "body": "It seems like this should be reported to Pyright. Why doesn't `t.IO` satisfy buffered reader? Why is this a union, if `t.IO` isn't correct; shouldn't it be only `BufferedReader`?",
+        "path": "src/flask/app.py",
+        "line": 326
+      },
+      {
+        "body": "Unfortunately the pyright inferrence doesn't seem to be smart enough to narrow down the type inside the conditional here when using the intermediate `len_rv` assignment..",
+        "path": "src/flask/app.py",
+        "line": 1172
+      },
+      {
+        "body": "Here is the builtin types for `open()` (See: https://github.com/python/typeshed/blob/main/stdlib/builtins.pyi#L1540). `t.IO[Any]` is the fallback if no `mode` is specified. So it doesn't always crossover with `BufferedReader`:\r\n\r\n```python\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: OpenTextMode = \"r\",\r\n    buffering: int = -1,\r\n    encoding: str | None = None,\r\n    errors: str | None = None,\r\n    newline: str | None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> TextIOWrapper: ...\r\n\r\n# Unbuffered binary mode: returns a FileIO\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: OpenBinaryMode,\r\n    buffering: Literal[0],\r\n    encoding: None = None,\r\n    errors: None = None,\r\n    newline: None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> FileIO: ...\r\n\r\n# Buffering is on: return BufferedRandom, BufferedReader, or BufferedWriter\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: OpenBinaryModeUpdating,\r\n    buffering: Literal[-1, 1] = -1,\r\n    encoding: None = None,\r\n    errors: None = None,\r\n    newline: None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> BufferedRandom: ...\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: OpenBinaryModeWriting,\r\n    buffering: Literal[-1, 1] = -1,\r\n    encoding: None = None,\r\n    errors: None = None,\r\n    newline: None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> BufferedWriter: ...\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: OpenBinaryModeReading,\r\n    buffering: Literal[-1, 1] = -1,\r\n    encoding: None = None,\r\n    errors: None = None,\r\n    newline: None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> BufferedReader: ...\r\n\r\n# Buffering cannot be determined: fall back to BinaryIO\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: OpenBinaryMode,\r\n    buffering: int = -1,\r\n    encoding: None = None,\r\n    errors: None = None,\r\n    newline: None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> BinaryIO: ...\r\n\r\n# Fallback if mode is not specified\r\n@overload\r\ndef open(\r\n    file: FileDescriptorOrPath,\r\n    mode: str,\r\n    buffering: int = -1,\r\n    encoding: str | None = None,\r\n    errors: str | None = None,\r\n    newline: str | None = None,\r\n    closefd: bool = True,\r\n    opener: _Opener | None = None,\r\n) -> IO[Any]: ...\r\n```",
+        "path": "src/flask/app.py",
+        "line": 326
+      },
+      {
+        "body": "OK, so typeshed says that we're returning `BufferedReader`. But is that a guarantee we want to make vs returning the more general `IO`? I need more information to understand this change, \"it passes pyright\" isn't enough because it also changes what we report our API to be.",
+        "path": "src/flask/app.py",
+        "line": 326
+      },
+      {
+        "body": "Please report that issue to Pyright and link it here so we can track when that's fixed. I don't like the idea of refactoring this in this way just to satisfy pyright. This is code that runs for _every single response_ and so adding extra calls is not free.",
+        "path": "src/flask/app.py",
+        "line": 1172
+      },
+      {
+        "body": "Ok, I can do that. If it seems like that either won't get fixed anytime soon, should we use a `cast()` here to help it along rather than `# ignore` so we at least get a little closer to type safety?\r\n",
+        "path": "src/flask/app.py",
+        "line": 1172
+      },
+      {
+        "body": "Prefer `ignore`, since a comment has no runtime cost.",
+        "path": "src/flask/app.py",
+        "line": 1172
+      },
+      {
+        "body": "Ok, that sounds good.  Thanks for being patient on this.",
+        "path": "src/flask/app.py",
+        "line": 1172
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": true,
+    "bug_description": "Pyright type errors",
+    "has_code_diff": true,
+    "lines_added": 14
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 5044,
+    "title": "added subdomain  to the \"flask routes\" command",
+    "body": "added a subdomain column to the output of flask routes, which previously output endpoints, methods and rules of each Rule in app.iter_map().\r\n\r\n- fixes #5004 \r\n\r\n",
+    "merged": false,
+    "diff": "diff --git a/src/flask/cli.py b/src/flask/cli.py\nindex 37a15ff2d8..3e982ca368 100644\n--- a/src/flask/cli.py\n+++ b/src/flask/cli.py\n@@ -1018,20 +1018,39 @@ def routes_command(sort: str, all_methods: bool) -> None:\n         for rule in rules\n     ]\n \n-    headers = (\"Endpoint\", \"Methods\", \"Rule\")\n-    widths = (\n-        max(len(rule.endpoint) for rule in rules),\n-        max(len(methods) for methods in rule_methods),\n-        max(len(rule.rule) for rule in rules),\n-    )\n-    widths = [max(len(h), w) for h, w in zip(headers, widths)]\n-    row = \"{{0:<{0}}}  {{1:<{1}}}  {{2:<{2}}}\".format(*widths)\n-\n-    click.echo(row.format(*headers).strip())\n-    click.echo(row.format(*(\"-\" * width for width in widths)))\n+    if max(len(rule.subdomain) for rule in rules if rule.subdomain is not None) == 0:\n+        headers = (\"Endpoint\", \"Methods\", \"Rule\")\n+        widths = (\n+            max(len(rule.endpoint) for rule in rules),\n+            max(len(methods) for methods in rule_methods),\n+            max(len(rule.rule) for rule in rules),\n+        )\n+        widths = [max(len(h), w) for h, w in zip(headers, widths)]\n+        row = \"{{0:<{0}}}  {{1:<{1}}}  {{2:<{2}}}\".format(*widths)\n+        click.echo(row.format(*headers).strip())\n+        click.echo(row.format(*(\"-\" * width for width in widths)))\n \n-    for rule, methods in zip(rules, rule_methods):\n-        click.echo(row.format(rule.endpoint, methods, rule.rule).rstrip())\n+        for rule, methods in zip(rules, rule_methods):\n+            click.echo(row.format(rule.endpoint, methods, rule.rule).rstrip())\n+    else:\n+        headers_extended = (\"Endpoint\", \"Methods\", \"Subdomain\", \"Rule\")\n+        widths_extended = (\n+            max(len(rule.endpoint) for rule in rules),\n+            max(len(methods) for methods in rule_methods),\n+            max(len(rule.subdomain) for rule in rules if rule.subdomain is not None),\n+            max(len(rule.rule) for rule in rules),\n+        )\n+        widths_extended = [\n+            max(len(h), w) for h, w in zip(headers_extended, widths_extended)\n+        ]\n+        row = \"{{0:<{0}}}  {{1:<{1}}}  {{2:<{2}}}  {{3:<{3}}}\".format(*widths_extended)\n+        click.echo(row.format(*headers_extended).strip())\n+        click.echo(row.format(*(\"-\" * width for width in widths_extended)))\n+\n+        for rule, methods in zip(rules, rule_methods):\n+            click.echo(\n+                row.format(rule.endpoint, methods, rule.subdomain, rule.rule).rstrip()\n+            )\n \n \n cli = FlaskGroup(\n",
+    "human_comments": [
+      {
+        "body": "```suggestion\r\n    headers = (\"Subdomain\", \"Endpoint\", \"Methods\", \"Rule\")\r\n```",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "Why just one space between the last two headers instead of two like before?",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "This is my first contribution to opensource stuff. Thought flask would be a good start because I use it very often. Apparently I have to write tests. Like I got a mail saying 12 checks failed or something. I don't know how to write tests for what I did.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "Look at the existing tests that now fail and adapt them.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "Specifically, you need to fix the existing tests, which are now failing because you changed the output.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "Oh thank you, and that will resolve that 12 checks failed issue?, cuz I don't even know what failed. It says Linux, Windows, Mac, etc..",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "Subdomain should be shown here before rule, not at the beginning of the table.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "click one one of the tests (pick one of the linux ones) and check the output. you can also run the tests locally.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "`subdomain` can be `None`, need to account for that.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "I did some edits for that, and ran pytest. 483 passed but 2 skipped. What does that mean. nothing fails after my edits.",
+        "path": "src/flask/cli.py",
+        "line": null
+      },
+      {
+        "body": "This duplicates most of the code twice. Instead, it should be refactored to support a variable number of columns.",
+        "path": "src/flask/cli.py",
+        "line": 1053
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 32
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 4992,
+    "title": "add file mode parameter to handle .toml config files in flask.Config.\u2026",
+    "body": "- fixes #4989 \r\nAdded optional boolean argument \"text\" (False by default).\r\n",
+    "merged": true,
+    "diff": "diff --git a/CHANGES.rst b/CHANGES.rst\nindex 88bfbc6839..8159ea452e 100644\n--- a/CHANGES.rst\n+++ b/CHANGES.rst\n@@ -33,6 +33,8 @@ Unreleased\n -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.\n     :pr:`4947`\n -   Ensure subdomains are applied with nested blueprints. :issue:`4834`\n+-   ``config.from_file`` can use ``text=False`` to indicate that the parser wants a\n+    binary file instead. :issue:`4989`\n \n \n Version 2.2.3\ndiff --git a/src/flask/config.py b/src/flask/config.py\nindex d4fc310fe3..5e48be3323 100644\n--- a/src/flask/config.py\n+++ b/src/flask/config.py\n@@ -234,6 +234,7 @@ def from_file(\n         filename: str,\n         load: t.Callable[[t.IO[t.Any]], t.Mapping],\n         silent: bool = False,\n+        text: bool = True,\n     ) -> bool:\n         \"\"\"Update the values in the config from a file that is loaded\n         using the ``load`` parameter. The loaded data is passed to the\n@@ -244,8 +245,8 @@ def from_file(\n             import json\n             app.config.from_file(\"config.json\", load=json.load)\n \n-            import toml\n-            app.config.from_file(\"config.toml\", load=toml.load)\n+            import tomllib\n+            app.config.from_file(\"config.toml\", load=tomllib.load, text=False)\n \n         :param filename: The path to the data file. This can be an\n             absolute path or relative to the config root path.\n@@ -254,14 +255,18 @@ def from_file(\n         :type load: ``Callable[[Reader], Mapping]`` where ``Reader``\n             implements a ``read`` method.\n         :param silent: Ignore the file if it doesn't exist.\n+        :param text: Open the file in text or binary mode.\n         :return: ``True`` if the file was loaded successfully.\n \n+        .. versionchanged:: 2.3\n+            The ``text`` parameter was added.\n+\n         .. versionadded:: 2.0\n         \"\"\"\n         filename = os.path.join(self.root_path, filename)\n \n         try:\n-            with open(filename) as f:\n+            with open(filename, \"r\" if text else \"rb\") as f:\n                 obj = load(f)\n         except OSError as e:\n             if silent and e.errno in (errno.ENOENT, errno.EISDIR):\ndiff --git a/tests/static/config.toml b/tests/static/config.toml\nnew file mode 100644\nindex 0000000000..64acdbdd09\n--- /dev/null\n+++ b/tests/static/config.toml\n@@ -0,0 +1,2 @@\n+TEST_KEY=\"foo\"\n+SECRET_KEY=\"config\"\ndiff --git a/tests/test_config.py b/tests/test_config.py\nindex 76c5d2721a..580ae864f6 100644\n--- a/tests/test_config.py\n+++ b/tests/test_config.py\n@@ -6,7 +6,6 @@\n \n import flask\n \n-\n # config keys used for the TestConfig\n TEST_KEY = \"foo\"\n SECRET_KEY = \"config\"\n@@ -30,13 +29,23 @@ def test_config_from_object():\n     common_object_test(app)\n \n \n-def test_config_from_file():\n+def test_config_from_file_json():\n     app = flask.Flask(__name__)\n     current_dir = os.path.dirname(os.path.abspath(__file__))\n     app.config.from_file(os.path.join(current_dir, \"static\", \"config.json\"), json.load)\n     common_object_test(app)\n \n \n+def test_config_from_file_toml():\n+    tomllib = pytest.importorskip(\"tomllib\", reason=\"tomllib added in 3.11\")\n+    app = flask.Flask(__name__)\n+    current_dir = os.path.dirname(os.path.abspath(__file__))\n+    app.config.from_file(\n+        os.path.join(current_dir, \"static\", \"config.toml\"), tomllib.load, text=False\n+    )\n+    common_object_test(app)\n+\n+\n def test_from_prefixed_env(monkeypatch):\n     monkeypatch.setenv(\"FLASK_STRING\", \"value\")\n     monkeypatch.setenv(\"FLASK_BOOL\", \"true\")\n",
+    "human_comments": [
+      {
+        "body": "this parameter is a absolute lie - when true you take away the text and drop a buffer\r\n\r\nthis should be called `binary`\r\n\r\nand it should use the open mode ",
+        "path": "src/flask/config.py",
+        "line": null
+      },
+      {
+        "body": "This should change what `open` does, not try to access `buffer` after the fact (someone else pointed out this wasn't documented as a public API).\r\n\r\nAlso, it's backwards, `text=True`, the default, should result in a text file, `False` should result in a binary file.",
+        "path": "src/flask/config.py",
+        "line": null
+      },
+      {
+        "body": "Can drop the `.0`.",
+        "path": "src/flask/config.py",
+        "line": null
+      },
+      {
+        "body": "This still uses the `toml` library, it needs to change to `tomllib` to be a useful example of the parameter.",
+        "path": "src/flask/config.py",
+        "line": null
+      },
+      {
+        "body": "Need to add documentation for the parameter.",
+        "path": "src/flask/config.py",
+        "line": 259
+      },
+      {
+        "body": "I addressed this in my review.",
+        "path": "src/flask/config.py",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 23
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 4969,
+    "title": "Add a devcontainer configuration",
+    "body": "This change adds the `.devcontainer` directory with a `devcontainer.json`, `post-create-command.sh`, and `welcome-message.txt`. The devcontainer configuration automatically runs the initial setup commands when a user creates a codespace from their forked repository, making it easier for users to get setup and start contributing.\r\n\r\nI opted to exclude virtual environment setup since a codespace is already an isolated, dedicated development environment, and users will only be able to access a single project (i.e., Flask) per codespace.\r\n\r\nYou can test these changes in a codespace by clicking the `Code` dropdown in this PR.\r\n\r\n<img width=\"1230\" alt=\"image\" src=\"https://user-images.githubusercontent.com/55098699/218227280-2bb94d0c-8275-42e0-9085-332403af0778.png\">\r\n\r\nIn VS Code, open the Command Palette from the settings gear icon and run the \"Codespaces: View Creation Log\" command to verify all dependencies were correctly installed.\r\n\r\n- fixes https://github.com/pallets/flask/issues/4965\r\n\r\nChecklist:\r\n\r\n- [x] ~Add tests that demonstrate the correct behavior of the change. Tests should fail without the change.~\r\n        Python tests aren't applicable to these changes\r\n- [x] Add or update relevant docs, in the docs folder and in code.\r\n- [x] Add an entry in `CHANGES.rst` summarizing the change and linking to the issue.\r\n- [x] Add `.. versionchanged::` entries in any relevant code docs.\r\n- [x] Run `pre-commit` hooks and fix any issues.\r\n- [x] Run `pytest` and `tox`, no tests failed.\r\n",
+    "merged": true,
+    "diff": "diff --git a/.devcontainer/devcontainer.json b/.devcontainer/devcontainer.json\nnew file mode 100644\nindex 0000000000..45198266c6\n--- /dev/null\n+++ b/.devcontainer/devcontainer.json\n@@ -0,0 +1,17 @@\n+{\n+  \"name\": \"pallets/flask\",\n+  \"image\": \"mcr.microsoft.com/devcontainers/python:3\",\n+  \"customizations\": {\n+    \"vscode\": {\n+      \"settings\": {\n+        \"python.defaultInterpreterPath\": \"${workspaceFolder}/.venv\",\n+        \"python.terminal.activateEnvInCurrentTerminal\": true,\n+        \"python.terminal.launchArgs\": [\n+          \"-X\",\n+          \"dev\"\n+        ]\n+      }\n+    }\n+  },\n+  \"onCreateCommand\": \".devcontainer/on-create-command.sh\"\n+}\ndiff --git a/.devcontainer/on-create-command.sh b/.devcontainer/on-create-command.sh\nnew file mode 100755\nindex 0000000000..deffa37bfe\n--- /dev/null\n+++ b/.devcontainer/on-create-command.sh\n@@ -0,0 +1,9 @@\n+#!/bin/bash\n+set -e\n+\n+python3 -m venv .venv\n+. .venv/bin/activate\n+pip install -U pip setuptools wheel\n+pip install -r requirements/dev.txt\n+pip install -e .\n+pre-commit install --install-hooks\ndiff --git a/CONTRIBUTING.rst b/CONTRIBUTING.rst\nindex 8962490fe5..5c12234525 100644\n--- a/CONTRIBUTING.rst\n+++ b/CONTRIBUTING.rst\n@@ -67,9 +67,29 @@ Include the following in your patch:\n .. _pre-commit: https://pre-commit.com\n \n \n-First time setup\n-~~~~~~~~~~~~~~~~\n+First time setup using GitHub Codespaces\n+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n \n+`GitHub Codespaces`_ creates a development environment that is already set up for the\n+project. By default it opens in Visual Studio Code for the Web, but this can\n+be changed in your GitHub profile settings to use Visual Studio Code or JetBrains\n+PyCharm on your local computer.\n+\n+-   Make sure you have a `GitHub account`_.\n+-   From the project's repository page, click the green \"Code\" button and then \"Create\n+    codespace on main\".\n+-   The codespace will be set up, then Visual Studio Code will open. However, you'll\n+    need to wait a bit longer for the Python extension to be installed. You'll know it's\n+    ready when the terminal at the bottom shows that the virtualenv was activated.\n+-   Check out a branch and `start coding`_.\n+\n+.. _GitHub Codespaces: https://docs.github.com/en/codespaces\n+.. _devcontainer: https://docs.github.com/en/codespaces/setting-up-your-project-for-codespaces/adding-a-dev-container-configuration/introduction-to-dev-containers\n+\n+First time setup in your local environment\n+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n+\n+-   Make sure you have a `GitHub account`_.\n -   Download and install the `latest version of git`_.\n -   Configure git with your `username`_ and `email`_.\n \n@@ -78,25 +98,16 @@ First time setup\n         $ git config --global user.name 'your name'\n         $ git config --global user.email 'your email'\n \n--   Make sure you have a `GitHub account`_.\n -   Fork Flask to your GitHub account by clicking the `Fork`_ button.\n--   `Clone`_ the main repository locally.\n+-   `Clone`_ your fork locally, replacing ``your-username`` in the command below with\n+    your actual username.\n \n     .. code-block:: text\n \n-        $ git clone https://github.com/pallets/flask\n+        $ git clone https://github.com/your-username/flask\n         $ cd flask\n \n--   Add your fork as a remote to push your work to. Replace\n-    ``{username}`` with your username. This names the remote \"fork\", the\n-    default Pallets remote is \"origin\".\n-\n-    .. code-block:: text\n-\n-        $ git remote add fork https://github.com/{username}/flask\n-\n--   Create a virtualenv.\n-\n+-   Create a virtualenv. Use the latest version of Python.\n \n     - Linux/macOS\n \n@@ -112,68 +123,65 @@ First time setup\n          > py -3 -m venv .venv\n          > env\\Scripts\\activate\n \n--   Upgrade pip and setuptools.\n-\n-    .. code-block:: text\n-\n-        $ python -m pip install --upgrade pip setuptools\n-\n--   Install the development dependencies, then install Flask in editable\n-    mode.\n+-   Install the development dependencies, then install Flask in editable mode.\n \n     .. code-block:: text\n \n+        $ python -m pip install -U pip setuptools wheel\n         $ pip install -r requirements/dev.txt && pip install -e .\n \n -   Install the pre-commit hooks.\n \n     .. code-block:: text\n \n-        $ pre-commit install\n+        $ pre-commit install --install-hooks\n \n+.. _GitHub account: https://github.com/join\n .. _latest version of git: https://git-scm.com/downloads\n .. _username: https://docs.github.com/en/github/using-git/setting-your-username-in-git\n .. _email: https://docs.github.com/en/github/setting-up-and-managing-your-github-user-account/setting-your-commit-email-address\n-.. _GitHub account: https://github.com/join\n .. _Fork: https://github.com/pallets/flask/fork\n .. _Clone: https://docs.github.com/en/github/getting-started-with-github/fork-a-repo#step-2-create-a-local-clone-of-your-fork\n \n+.. _start coding:\n \n Start coding\n ~~~~~~~~~~~~\n \n--   Create a branch to identify the issue you would like to work on. If\n-    you're submitting a bug or documentation fix, branch off of the\n-    latest \".x\" branch.\n+-   Create a branch to identify the issue you would like to work on. If you're\n+    submitting a bug or documentation fix, branch off of the latest \".x\" branch.\n \n     .. code-block:: text\n \n         $ git fetch origin\n         $ git checkout -b your-branch-name origin/2.0.x\n \n-    If you're submitting a feature addition or change, branch off of the\n-    \"main\" branch.\n+    If you're submitting a feature addition or change, branch off of the \"main\" branch.\n \n     .. code-block:: text\n \n         $ git fetch origin\n         $ git checkout -b your-branch-name origin/main\n \n--   Using your favorite editor, make your changes,\n-    `committing as you go`_.\n--   Include tests that cover any code changes you make. Make sure the\n-    test fails without your patch. Run the tests as described below.\n--   Push your commits to your fork on GitHub and\n-    `create a pull request`_. Link to the issue being addressed with\n-    ``fixes #123`` in the pull request.\n+-   Using your favorite editor, make your changes, `committing as you go`_.\n+\n+    -   If you are in a codespace, you will be prompted to `create a fork`_ the first\n+        time you make a commit. Enter ``Y`` to continue.\n+\n+-   Include tests that cover any code changes you make. Make sure the test fails without\n+    your patch. Run the tests as described below.\n+-   Push your commits to your fork on GitHub and `create a pull request`_. Link to the\n+    issue being addressed with ``fixes #123`` in the pull request description.\n \n     .. code-block:: text\n \n-        $ git push --set-upstream fork your-branch-name\n+        $ git push --set-upstream origin your-branch-name\n \n .. _committing as you go: https://afraid-to-commit.readthedocs.io/en/latest/git/commandlinegit.html#commit-your-changes\n+.. _create a fork: https://docs.github.com/en/codespaces/developing-in-codespaces/using-source-control-in-your-codespace#about-automatic-forking\n .. _create a pull request: https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request\n \n+.. _Running the tests:\n \n Running the tests\n ~~~~~~~~~~~~~~~~~\n@@ -201,6 +209,9 @@ Generating a report of lines that do not have test coverage can indicate\n where to start contributing. Run ``pytest`` using ``coverage`` and\n generate a report.\n \n+If you are using GitHub Codespaces, ``coverage`` is already installed\n+so you can skip the installation command.\n+\n .. code-block:: text\n \n     $ pip install coverage\n",
+    "human_comments": [
+      {
+        "body": "I opted to place this in front of the \"First time setup in your local environment\" section in the hopes that contributors don't go through all the local environment setup steps, and then realize that a codespace may have been a simpler option.",
+        "path": "CONTRIBUTING.rst",
+        "line": 70
+      },
+      {
+        "body": "This only runs at initial creation or if users rebuild their codespace. Stopping and restarting a codespace will put users back where they left off.",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "This installs Python and basic utilities. For more info, see https://github.com/devcontainers/features/tree/main/src/python",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "This message will only show at initial codespace creation or if a codespace is rebuilt.",
+        "path": ".devcontainer/welcome-message.txt",
+        "line": null
+      },
+      {
+        "body": "Is there a way to move from Codespaces to the contributor's local VS Code? Especially at conference sprints, it would be handy for people to get their own local dev environment as well.",
+        "path": "CONTRIBUTING.rst",
+        "line": 70
+      },
+      {
+        "body": "This needs to install into a virtualenv. Installing to the system Python, even in a container, can lead to unexpected issues.",
+        "path": ".devcontainer/post-create-command.sh",
+        "line": null
+      },
+      {
+        "body": "This doesn't need a change entry, as it's not a code change that affects users installing the library.",
+        "path": "CHANGES.rst",
+        "line": null
+      },
+      {
+        "body": "The best way for contributors to work in their local dev environments is to follow the local setup steps in your contributing guide.  We currently do not support the use of local resources for Codespaces, which have cloud storage and compute and are designed to be a one-click, isolated, and ephemeral development experience.\r\n\r\nOf course, any changes users push from their codespace to their remote fork are available for cloning locally. Contributors may also [export their codespace changes to another branch](https://docs.github.com/en/codespaces/troubleshooting/exporting-changes-to-a-branch), if desired.",
+        "path": "CONTRIBUTING.rst",
+        "line": 70
+      },
+      {
+        "body": "Isn't there some VS Code feature that allows switching between local and cloud editors? Could have sworn I'd seen something about that.",
+        "path": "CONTRIBUTING.rst",
+        "line": 70
+      },
+      {
+        "body": "Oh, of course! I forgot to add that in, and apologies if I misunderstood your question.\r\n\r\nYes, you can use Codespaces both in the browser and on desktop. The [GitHub Codespaces](https://marketplace.visualstudio.com/items?itemName=GitHub.codespaces) extension for VS Code works for both. Contributors can change their default editor under their [Codespaces settings](https://docs.github.com/en/codespaces/customizing-your-codespace/setting-your-default-editor-for-github-codespaces).\r\n\r\nWould you like me to add that information to the contributing guide?",
+        "path": "CONTRIBUTING.rst",
+        "line": 70
+      },
+      {
+        "body": "Sure, seems useful to know.",
+        "path": "CONTRIBUTING.rst",
+        "line": 70
+      },
+      {
+        "body": "This has been updated! Just so I understand clearly, since I'm not familiar with Python development, are users expected to do all their development and run tests within a venv?\r\n\r\nI'm trying to figure out the cleanest way for to activate a venv for users once the devcontainer has finished installing the dependencies. So far, the options are to:\r\n1. Simply prompt users to activate their venv in the welcome text (I think this is the easiest route, but users might forget to do this since the text only shows after initial creation)\r\n2. Use a `postAttachCommand` in the devcontainer to open an additional terminal with the venv activated (this could be confusing to contributors)\r\n3. Configure the .bashrc and other popular terminals to automatically run the activation command when opened (this has the best coverage but requires a bit more work)\r\n\r\nI'm interested to see what you think is the best option for contributors.",
+        "path": ".devcontainer/post-create-command.sh",
+        "line": null
+      },
+      {
+        "body": "Yes, Python projects use virtualenvs both during development and deployment. You might find this article about activating a virtualenv in a container useful: https://pythonspeed.com/articles/activate-virtualenv-dockerfile/. Basically all activating actually does is set the `VIRTUAL_ENV` env var to the base path, and add `$VIRTUAL_ENV/bin` to `PATH`.",
+        "path": ".devcontainer/post-create-command.sh",
+        "line": null
+      },
+      {
+        "body": "This installs the python extension and uses it to set the default interpreter and activate the venv.\r\n\r\nBecause the extension is still loading at initial creation, the venv doesn't activate on the initial terminal. It does activate on any new terminals or upon reconnecting to a codespace. I updated the welcome text and contributing guide accordingly.",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "```suggestion\r\n\t\"image\": \"mcr.microsoft.com/devcontainers/python:3\",\r\n```\r\n\r\nCan we use the [updated image path](https://github.com/devcontainers/images/tree/main/src/python)? Thanks! ",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "The [python image](https://github.com/devcontainers/images/blob/main/src/python/.devcontainer/devcontainer.json#L14) adds a python Feature, which contains this info. Hence, can we remove `customizations` to avoid duplication?\r\n\r\nhttps://github.com/devcontainers/features/blob/main/src/python/devcontainer-feature.json#L56-L75",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "<s>Suggestion: You could avoid adding `onCreateCommand` if you move this command to the Dockerfile.",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "```suggestion\r\n\ud83d\udc4b  Welcome to \"Flask\" in GitHub Codespaces!\r\n```",
+        "path": ".devcontainer/welcome-message.txt",
+        "line": null
+      },
+      {
+        "body": "This is what's being used to activate the `venv` in each terminal, so I can't fully remove it - I can clean it up though.",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "Never mind, I accidentally thought this PR had a Dockerfile",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "@davidism Rather than introduce complexity by trying to fix the issue with the welcome text being cleared from the terminal, I think a simpler solution is to open the file at launch.\r\n\r\nIf that works for you, we can move the `welcome-message.txt` to a better home in the project, or replace it with a codespaces-specific contributing guide. We can also just open `CONTRIBUTING.rst` at launch, and contributors can read through to the relevant section.",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "Any thoughts on this @davidism?",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "Turns out there's a simple fix here with a vscode setting. Should be solved now!",
+        "path": ".devcontainer/devcontainer.json",
+        "line": null
+      },
+      {
+        "body": "Since the guide instructs contributors to fork first, is this necessary? When I open a codespace on this PR, I see your fork as `origin`, and pallets as `upstream`. Maybe we just change the guide, probably a bit simpler to push to `origin` than to remember to push to `fork`.\r\n\r\nAdditionally, is there any way to automate _creating_ the fork so that users can start the codespace from pallets? I think the basic GitHub editor does this.",
+        "path": ".devcontainer/on-create-command.sh",
+        "line": null
+      },
+      {
+        "body": "Good catch - I've removed this section and added instructions for automatic forking. If starting from pallets, users will be prompted to create a fork the first time they make a commit. Reference docs are [here](https://docs.github.com/en/codespaces/developing-in-codespaces/using-source-control-in-your-codespace#about-automatic-forking).",
+        "path": ".devcontainer/on-create-command.sh",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": false,
+    "bug_description": "",
+    "has_code_diff": true,
+    "lines_added": 75
+  },
+  {
+    "repo": "pallets/flask",
+    "pr_number": 4935,
+    "title": "Fix subdomain inheritance for nested blueprints",
+    "body": "This replaces #4856\r\n\r\nChecklist:\r\n\r\n- [x] Add tests that demonstrate the correct behavior of the change. Tests should fail without the change.\r\n- [x] Add or update relevant docs, in the docs folder and in code.\r\n- [x] Add an entry in `CHANGES.rst` summarizing the change and linking to the issue.\r\n- [x] Add `.. versionchanged::` entries in any relevant code docs.\r\n- [x] Run `pre-commit` hooks and fix any issues.\r\n- [x] Run `pytest` and `tox`, no tests failed.\r\n",
+    "merged": true,
+    "diff": "diff --git a/CHANGES.rst b/CHANGES.rst\nindex adf2623d59..bcec74a76b 100644\n--- a/CHANGES.rst\n+++ b/CHANGES.rst\n@@ -3,6 +3,8 @@ Version 2.3.0\n \n Unreleased\n \n+-   Ensure subdomains are applied with nested blueprints. :issue:`4834`\n+\n \n Version 2.2.3\n -------------\ndiff --git a/docs/blueprints.rst b/docs/blueprints.rst\nindex af368bacf1..d5cf3d8237 100644\n--- a/docs/blueprints.rst\n+++ b/docs/blueprints.rst\n@@ -140,6 +140,19 @@ name, and child URLs will be prefixed with the parent's URL prefix.\n     url_for('parent.child.create')\n     /parent/child/create\n \n+In addition a child blueprint's will gain their parent's subdomain,\n+with their subdomain as prefix if present i.e.\n+\n+.. code-block:: python\n+\n+    parent = Blueprint('parent', __name__, subdomain='parent')\n+    child = Blueprint('child', __name__, subdomain='child')\n+    parent.register_blueprint(child)\n+    app.register_blueprint(parent)\n+\n+    url_for('parent.child.create', _external=True)\n+    \"child.parent.domain.tld\"\n+\n Blueprint-specific before request functions, etc. registered with the\n parent will trigger for the child. If a child does not have an error\n handler that can handle a given exception, the parent's will be tried.\ndiff --git a/src/flask/blueprints.py b/src/flask/blueprints.py\nindex f6d62ba83f..2403be1cf8 100644\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -358,6 +358,9 @@ def register(self, app: \"Flask\", options: dict) -> None:\n         :param options: Keyword arguments forwarded from\n             :meth:`~Flask.register_blueprint`.\n \n+        .. versionchanged:: 2.3\n+            Nested blueprints now correctly apply subdomains.\n+\n         .. versionchanged:: 2.0.1\n             Nested blueprints are registered with their dotted name.\n             This allows different blueprints with the same name to be\n@@ -453,6 +456,17 @@ def extend(bp_dict, parent_dict):\n         for blueprint, bp_options in self._blueprints:\n             bp_options = bp_options.copy()\n             bp_url_prefix = bp_options.get(\"url_prefix\")\n+            bp_subdomain = bp_options.get(\"subdomain\")\n+\n+            if bp_subdomain is None:\n+                bp_subdomain = blueprint.subdomain\n+\n+            if state.subdomain is not None and bp_subdomain is not None:\n+                bp_options[\"subdomain\"] = bp_subdomain + \".\" + state.subdomain\n+            elif bp_subdomain is not None:\n+                bp_options[\"subdomain\"] = bp_subdomain\n+            elif state.subdomain is not None:\n+                bp_options[\"subdomain\"] = state.subdomain\n \n             if bp_url_prefix is None:\n                 bp_url_prefix = blueprint.url_prefix\ndiff --git a/tests/test_blueprints.py b/tests/test_blueprints.py\nindex 1bf130f52b..dbe00b974c 100644\n--- a/tests/test_blueprints.py\n+++ b/tests/test_blueprints.py\n@@ -950,6 +950,55 @@ def index():\n     assert response.status_code == 200\n \n \n+def test_nesting_subdomains(app, client) -> None:\n+    subdomain = \"api\"\n+    parent = flask.Blueprint(\"parent\", __name__)\n+    child = flask.Blueprint(\"child\", __name__)\n+\n+    @child.route(\"/child/\")\n+    def index():\n+        return \"child\"\n+\n+    parent.register_blueprint(child)\n+    app.register_blueprint(parent, subdomain=subdomain)\n+\n+    client.allow_subdomain_redirects = True\n+\n+    domain_name = \"domain.tld\"\n+    app.config[\"SERVER_NAME\"] = domain_name\n+    response = client.get(\"/child/\", base_url=\"http://api.\" + domain_name)\n+\n+    assert response.status_code == 200\n+\n+\n+def test_child_and_parent_subdomain(app, client) -> None:\n+    child_subdomain = \"api\"\n+    parent_subdomain = \"parent\"\n+    parent = flask.Blueprint(\"parent\", __name__)\n+    child = flask.Blueprint(\"child\", __name__, subdomain=child_subdomain)\n+\n+    @child.route(\"/\")\n+    def index():\n+        return \"child\"\n+\n+    parent.register_blueprint(child)\n+    app.register_blueprint(parent, subdomain=parent_subdomain)\n+\n+    client.allow_subdomain_redirects = True\n+\n+    domain_name = \"domain.tld\"\n+    app.config[\"SERVER_NAME\"] = domain_name\n+    response = client.get(\n+        \"/\", base_url=f\"http://{child_subdomain}.{parent_subdomain}.{domain_name}\"\n+    )\n+\n+    assert response.status_code == 200\n+\n+    response = client.get(\"/\", base_url=f\"http://{parent_subdomain}.{domain_name}\")\n+\n+    assert response.status_code == 404\n+\n+\n def test_unique_blueprint_names(app, client) -> None:\n     bp = flask.Blueprint(\"bp\", __name__)\n     bp2 = flask.Blueprint(\"bp\", __name__)\n",
+    "human_comments": [
+      {
+        "body": "Should be `.` (period), not `,` (comma).",
+        "path": "src/flask/blueprints.py",
+        "line": null
+      },
+      {
+        "body": "Putting this in quotes would make it more distinct from the code.",
+        "path": "docs/blueprints.rst",
+        "line": null
+      },
+      {
+        "body": "Ta",
+        "path": "src/flask/blueprints.py",
+        "line": null
+      },
+      {
+        "body": "Ta",
+        "path": "docs/blueprints.rst",
+        "line": null
+      }
+    ],
+    "pr_type": "bug_fix",
+    "bug_confirmed": true,
+    "bug_description": "subdomain inheritance for nested blueprints",
+    "has_code_diff": true,
+    "lines_added": 78
+  }
+]
