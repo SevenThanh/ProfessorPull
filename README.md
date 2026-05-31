@@ -5,7 +5,9 @@
 
 An AI-powered GitHub App that automatically reviews pull requests using a three-agent pipeline backed by RAG (Retrieval-Augmented Generation).
 
-When a PR is opened or updated, TriAgents fetches the diff, retrieves semantically relevant context from the repository via Pinecone, runs three specialized AI agents in sequence, and posts a structured code review comment directly to the PR.
+When a PR is opened or updated, TriAgents fetches the diff, retrieves semantically relevant context from across the whole repository via Pinecone, runs three specialized AI agents in sequence, and posts a structured code review comment directly to the PR.
+
+The retrieval layer is what lets the reviewer reason beyond the diff. Instead of looking only at the changed lines, TriAgents embeds the full repo and pulls in the most relevant code from *other* files — callers, related helpers, shared types — so the reasoning agent can catch issues that only show up in context (a broken caller, a violated invariant, an API change with downstream impact).
 
 ## How It Works
 
@@ -16,7 +18,7 @@ PR opened/updated
   GitHub Webhook
        │
        ▼
-  RAG Retrieval  ──── Pinecone (semantic search over repo)
+  RAG Retrieval  ──── Pinecone (cross-file semantic search over the repo)
        │
        ▼
   Agent 1: Diff Summarizer (Qwen3-Coder)
@@ -34,7 +36,7 @@ PR opened/updated
   GitHub PR Review posted
 ```
 
-All three agents are called via the [OpenRouter](https://openrouter.ai/) API — no local GPU required. Embeddings for RAG use OpenAI `text-embedding-3-small` (768-dim).
+All three agents are called via the [OpenRouter](https://openrouter.ai/) API — no local GPU required. Retrieval embeds repo files with OpenAI `text-embedding-3-small` (768-dim) and stores them in a per-repo Pinecone namespace; the first PR for a repo triggers an automatic ingest, and later PRs query that namespace for context. No manual indexing step is required.
 
 ## Project Structure
 
