@@ -1,6 +1,7 @@
 # TriAgents - Multi-agents PR Reviewer
 
-<img width="625" height="469" alt="Screenshot 2026-05-26 at 3 31 43 PM" src="https://github.com/user-attachments/assets/142b17e4-3a2b-483c-a20c-79a03e081d23" />
+<img width="9600" height="7200" alt="TriAgents_Research-1" src="https://github.com/user-attachments/assets/6fc643d5-424a-4006-bdbd-5ea42cd541d1" />
+
 
 
 An AI-powered GitHub App that automatically reviews pull requests using a three-agent pipeline backed by RAG (Retrieval-Augmented Generation).
